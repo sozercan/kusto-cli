@@ -1,40 +1,33 @@
 # Agent guide
 
-`kusto-cli` is designed to be easy for agents to operate safely:
+`kusto-cli` is designed for both humans and agents.
 
-- Default mode is MCP over stdio.
-- Direct commands return JSON.
-- Read-only query tools set Kusto readonly request properties.
-- User-supplied request properties cannot disable readonly flags.
-- Credentials are read from the environment or Azure CLI; no prompts are emitted by the CLI itself.
+Use human-friendly commands first:
 
-## Recommended MCP server config
+```bash
+kusto-cli query 'StormEvents | count'
+kusto-cli databases list
+kusto-cli tables describe StormEvents
+kusto-cli tables sample StormEvents 5
+```
+
+Use the raw MCP API explorer only when a high-level command does not exist:
+
+```bash
+kusto-cli api tools
+kusto-cli api schema kusto_query
+kusto-cli api call kusto_query '{"cluster_uri":"https://help.kusto.windows.net","database":"Samples","query":"StormEvents | count"}'
+```
+
+## MCP server mode
+
+For agents that need a stdio MCP server:
 
 ```json
 {
   "command": "/absolute/path/to/kusto-cli",
-  "args": ["--service-uri", "https://help.kusto.windows.net", "--database", "Samples"]
+  "args": ["--service-uri", "https://help.kusto.windows.net", "--database", "Samples", "serve"]
 }
-```
-
-## Direct command mode
-
-Run a query:
-
-```bash
-kusto-cli --service-uri https://help.kusto.windows.net --database Samples query 'StormEvents | count'
-```
-
-Run a management command:
-
-```bash
-kusto-cli --service-uri https://help.kusto.windows.net --database Samples command '.show tables'
-```
-
-Call an MCP tool directly:
-
-```bash
-kusto-cli call kusto_known_services '{}'
 ```
 
 ## Non-interactive auth

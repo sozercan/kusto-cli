@@ -209,11 +209,177 @@ func (s *server) loadKnownServices() error {
 
 func (s *server) runCommand(ctx context.Context, args []string) error {
 	switch args[0] {
+	case "query":
+		return s.runQueryCommand(ctx, args[1:])
+	case "command":
+		return s.runMgmtCommand(ctx, args[1:])
+	case "databases", "database":
+		return s.runDatabaseCommand(ctx, args[1:])
+	case "tables", "table":
+		return s.runTableCommand(ctx, args[1:])
+	case "entities", "entity":
+		return s.runEntityCommand(ctx, args[1:])
+	case "services", "service":
+		return s.runServiceCommand(ctx, args[1:])
+	case "deeplink":
+		return s.runDeeplinkCommand(ctx, args[1:])
+	case "queryplan":
+		return s.runQueryPlanCommand(ctx, args[1:])
+	case "diagnostics":
+		return s.runDiagnosticsCommand(ctx, args[1:])
+	case "api":
+		return s.runAPICommand(ctx, args[1:])
+	case "tools": // backwards-compatible alias for api tools
+		return s.runAPICommand(ctx, []string{"tools"})
+	case "schema": // backwards-compatible alias for api schema
+		return s.runAPICommand(ctx, append([]string{"schema"}, args[1:]...))
+	case "call": // backwards-compatible alias for api call
+		return s.runAPICommand(ctx, append([]string{"call"}, args[1:]...))
+	case "auth":
+		return s.runAuthCommand(ctx, args[1:])
+	case "config":
+		return runConfigCommand("kusto-cli", args[1:])
+	case "completion":
+		return runCompletionCommand("kusto-cli", args[1:])
+	case "help":
+		printKustoUsage(os.Stdout)
+		return nil
+	default:
+		return fmt.Errorf("unknown command %q (run 'kusto-cli help')", args[0])
+	}
+}
+
+func (s *server) runQueryCommand(ctx context.Context, args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: kusto-cli query '<kql>'")
+	}
+	text, err := s.callTool(ctx, "kusto_query", mustMarshal(map[string]any{"cluster_uri": s.defaultClusterURI(), "database": s.cfg.database, "query": args[0]}))
+	if err != nil {
+		return err
+	}
+	return writeDirectText(os.Stdout, s.cfg.output, text)
+}
+
+func (s *server) runMgmtCommand(ctx context.Context, args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: kusto-cli command '<management-command>'")
+	}
+	text, err := s.callTool(ctx, "kusto_command", mustMarshal(map[string]any{"cluster_uri": s.defaultClusterURI(), "database": s.cfg.database, "command": args[0]}))
+	if err != nil {
+		return err
+	}
+	return writeDirectText(os.Stdout, s.cfg.output, text)
+}
+
+func (s *server) runDatabaseCommand(ctx context.Context, args []string) error {
+	if len(args) == 0 || args[0] == "list" {
+		text, err := s.callTool(ctx, "kusto_list_entities", mustMarshal(map[string]any{"cluster_uri": s.defaultClusterURI(), "entity_type": "databases"}))
+		if err != nil {
+			return err
+		}
+		return writeDirectText(os.Stdout, s.cfg.output, text)
+	}
+	return fmt.Errorf("unknown databases command %q", args[0])
+}
+
+func (s *server) runTableCommand(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: kusto-cli tables <list|describe|sample> ...")
+	}
+	switch args[0] {
+	case "list":
+		text, err := s.callTool(ctx, "kusto_list_entities", mustMarshal(map[string]any{"cluster_uri": s.defaultClusterURI(), "database": s.cfg.database, "entity_type": "tables"}))
+		if err != nil {
+			return err
+		}
+		return writeDirectText(os.Stdout, s.cfg.output, text)
+	case "describe":
+		if len(args) < 2 {
+			return errors.New("usage: kusto-cli tables describe <table-name>")
+		}
+		text, err := s.callTool(ctx, "kusto_describe_database_entity", mustMarshal(map[string]any{"cluster_uri": s.defaultClusterURI(), "database": s.cfg.database, "entity_type": "table", "entity_name": args[1]}))
+		if err != nil {
+			return err
+		}
+		return writeDirectText(os.Stdout, s.cfg.output, text)
+	case "sample":
+		if len(args) < 2 {
+			return errors.New("usage: kusto-cli tables sample <table-name> [sample-size]")
+		}
+		size := 10
+		if len(args) > 2 {
+			if v, err := strconv.Atoi(args[2]); err == nil {
+				size = v
+			}
+		}
+		text, err := s.callTool(ctx, "kusto_sample_entity", mustMarshal(map[string]any{"cluster_uri": s.defaultClusterURI(), "database": s.cfg.database, "entity_type": "table", "entity_name": args[1], "sample_size": size}))
+		if err != nil {
+			return err
+		}
+		return writeDirectText(os.Stdout, s.cfg.output, text)
+	default:
+		return fmt.Errorf("unknown tables command %q", args[0])
+	}
+}
+
+func (s *server) runEntityCommand(ctx context.Context, args []string) error {
+	if len(args) < 2 || args[0] != "list" {
+		return errors.New("usage: kusto-cli entities list <entity-type>")
+	}
+	text, err := s.callTool(ctx, "kusto_list_entities", mustMarshal(map[string]any{"cluster_uri": s.defaultClusterURI(), "database": s.cfg.database, "entity_type": args[1]}))
+	if err != nil {
+		return err
+	}
+	return writeDirectText(os.Stdout, s.cfg.output, text)
+}
+
+func (s *server) runServiceCommand(ctx context.Context, args []string) error {
+	if len(args) == 0 || args[0] == "list" {
+		return writeOutput(os.Stdout, s.cfg.output, s.knownServices)
+	}
+	return fmt.Errorf("unknown services command %q", args[0])
+}
+
+func (s *server) runDeeplinkCommand(ctx context.Context, args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: kusto-cli deeplink '<kql>'")
+	}
+	text, err := s.callTool(ctx, "kusto_deeplink_from_query", mustMarshal(map[string]any{"cluster_uri": s.defaultClusterURI(), "database": s.cfg.database, "query": args[0]}))
+	if err != nil {
+		return err
+	}
+	return writeDirectText(os.Stdout, s.cfg.output, text)
+}
+
+func (s *server) runQueryPlanCommand(ctx context.Context, args []string) error {
+	if len(args) < 1 {
+		return errors.New("usage: kusto-cli queryplan '<kql>'")
+	}
+	text, err := s.callTool(ctx, "kusto_show_queryplan", mustMarshal(map[string]any{"cluster_uri": s.defaultClusterURI(), "database": s.cfg.database, "query": args[0]}))
+	if err != nil {
+		return err
+	}
+	return writeDirectText(os.Stdout, s.cfg.output, text)
+}
+
+func (s *server) runDiagnosticsCommand(ctx context.Context, args []string) error {
+	text, err := s.callTool(ctx, "kusto_diagnostics", mustMarshal(map[string]any{"cluster_uri": s.defaultClusterURI(), "database": s.cfg.database}))
+	if err != nil {
+		return err
+	}
+	return writeDirectText(os.Stdout, s.cfg.output, text)
+}
+
+func (s *server) runAPICommand(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: kusto-cli api <tools|schema|call>")
+	}
+	switch args[0] {
 	case "tools":
 		return writeOutput(os.Stdout, s.cfg.output, map[string]any{"tools": toolDefinitions()})
 	case "schema":
 		if len(args) < 2 {
-			return errors.New("usage: kusto-cli schema <tool-name>")
+			return errors.New("usage: kusto-cli api schema <tool-name>")
 		}
 		tool, err := findToolDefinition(args[1])
 		if err != nil {
@@ -222,42 +388,32 @@ func (s *server) runCommand(ctx context.Context, args []string) error {
 		return writeOutput(os.Stdout, s.cfg.output, tool)
 	case "call":
 		if len(args) < 3 {
-			return errors.New("usage: kusto-cli call <tool-name> '<json-arguments>'")
+			return errors.New("usage: kusto-cli api call <tool-name> '<json-arguments>'")
 		}
 		text, err := s.callTool(ctx, args[1], json.RawMessage(args[2]))
 		if err != nil {
 			return err
 		}
 		return writeDirectText(os.Stdout, s.cfg.output, text)
-	case "query":
-		if len(args) < 2 {
-			return errors.New("usage: kusto-cli query '<kql>'")
-		}
-		cluster := s.defaultClusterURI()
-		text, err := s.callTool(ctx, "kusto_query", mustMarshal(map[string]any{"cluster_uri": cluster, "database": s.cfg.database, "query": args[1]}))
-		if err != nil {
-			return err
-		}
-		return writeDirectText(os.Stdout, s.cfg.output, text)
-	case "command":
-		if len(args) < 2 {
-			return errors.New("usage: kusto-cli command '<management-command>'")
-		}
-		cluster := s.defaultClusterURI()
-		text, err := s.callTool(ctx, "kusto_command", mustMarshal(map[string]any{"cluster_uri": cluster, "database": s.cfg.database, "command": args[1]}))
-		if err != nil {
-			return err
-		}
-		return writeDirectText(os.Stdout, s.cfg.output, text)
-	case "auth":
-		return s.runAuthCommand(ctx, args[1:])
-	case "config":
-		return runConfigCommand("kusto-cli", args[1:])
-	case "completion":
-		return runCompletionCommand("kusto-cli", args[1:])
 	default:
-		return fmt.Errorf("unknown command %q (expected: serve, tools, schema, call, query, command, auth, config, completion)", args[0])
+		return fmt.Errorf("unknown api command %q", args[0])
 	}
+}
+
+func printKustoUsage(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  kusto-cli --service-uri <cluster> --database <db> query '<kql>'
+  kusto-cli databases list
+  kusto-cli tables list
+  kusto-cli tables describe <table>
+  kusto-cli tables sample <table> [size]
+  kusto-cli command '.show tables'
+  kusto-cli deeplink '<kql>'
+  kusto-cli queryplan '<kql>'
+  kusto-cli diagnostics
+  kusto-cli api tools|schema|call ...
+  kusto-cli auth status
+  kusto-cli config show`)
 }
 
 func findToolDefinition(name string) (map[string]any, error) {
@@ -513,7 +669,7 @@ func runCompletionCommand(name string, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: completion <bash|zsh|fish>")
 	}
-	commands := "serve tools schema call query command auth config completion"
+	commands := "query command databases tables entities services deeplink queryplan diagnostics api auth config completion"
 	switch args[0] {
 	case "bash":
 		fmt.Fprintf(os.Stdout, "complete -W %q %s\n", commands, name)

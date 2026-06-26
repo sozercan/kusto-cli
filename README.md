@@ -1,6 +1,6 @@
 # kusto-cli
 
-Standalone, agent-friendly Go CLI for Kusto MCP workflows. It can run as an MCP stdio server for agents or as a direct JSON command runner for scripts.
+Standalone, agent-friendly Go CLI for Kusto workflows. It provides human-readable subcommands and also includes a raw MCP API explorer for advanced automation.
 
 It runs as a self-contained Go binary with standard environment and Azure CLI authentication options.
 
@@ -25,56 +25,42 @@ go build -o bin/kusto-cli ./cmd/kusto-cli
 
 ## Quick start
 
-Run as an MCP stdio server, which is the default mode used by agent clients:
-
-```bash
-bin/kusto-cli --service-uri https://help.kusto.windows.net --database Samples
-```
-
-Run a direct read-only query and print JSON:
-
-```bash
-bin/kusto-cli \
-  --service-uri https://help.kusto.windows.net \
-  --database Samples \
-  query 'StormEvents | count'
-```
-
-List available MCP tools as JSON:
-
-```bash
-bin/kusto-cli tools
-```
-
-Inspect a single tool schema:
-
-```bash
-bin/kusto-cli schema kusto_query
-```
-
-Generate shell completion:
-
-```bash
-bin/kusto-cli completion zsh
-```
-
-Call any MCP tool directly:
-
-```bash
-bin/kusto-cli call kusto_deeplink_from_query \
-  '{"cluster_uri":"https://help.kusto.windows.net","database":"Samples","query":"StormEvents | count"}'
-```
-
-## Public sample endpoint
-
-For documentation and smoke testing, use the public Kusto help cluster:
+Use the public sample endpoint for examples:
 
 ```text
 Cluster URI: https://help.kusto.windows.net
 Database:    Samples
 ```
 
-The endpoint is public, but REST query execution still requires Entra authentication.
+Run a query:
+
+```bash
+kusto-cli --service-uri https://help.kusto.windows.net --database Samples query 'StormEvents | count'
+```
+
+List databases:
+
+```bash
+kusto-cli --service-uri https://help.kusto.windows.net --database Samples databases list
+```
+
+Describe a table:
+
+```bash
+kusto-cli --service-uri https://help.kusto.windows.net --database Samples tables describe StormEvents
+```
+
+Sample rows:
+
+```bash
+kusto-cli --service-uri https://help.kusto.windows.net --database Samples tables sample StormEvents 5
+```
+
+Run as an MCP stdio server:
+
+```bash
+kusto-cli --service-uri https://help.kusto.windows.net --database Samples serve
+```
 
 ## Authentication
 
@@ -83,26 +69,46 @@ The endpoint is public, but REST query execution still requires Entra authentica
 1. `KUSTO_ACCESS_TOKEN`
 2. `az account get-access-token --resource https://kusto.kusto.windows.net`
 
-Auth modes:
+Check auth:
 
-| Mode | Behavior |
-|------|----------|
-| `--auth auto` | Environment token, then Azure CLI |
-| `--auth env` | Environment token only |
-| `--auth azcli` | Azure CLI only |
-| `--auth none` | No query execution; useful only for command discovery and diagnostics |
+```bash
+kusto-cli auth status
+```
 
-## Configuration
+## Common commands
 
-| Flag | Env var | Default | Description |
-|------|---------|---------|-------------|
-| `--service-uri` | `KUSTO_SERVICE_URI` | — | Default Kusto cluster URI |
-| `--database` | `KUSTO_SERVICE_DEFAULT_DB` | `NetDefaultDB` | Default database |
-| `--known-services` | `KUSTO_KNOWN_SERVICES` | — | JSON array of known services |
-| `--token-env` | — | `KUSTO_ACCESS_TOKEN` | Environment variable containing a bearer token |
-| `--auth` | — | `auto` | `auto`, `env`, `azcli`, or `none` |
-| `--timeout` | — | `90s` | HTTP and TLS handshake timeout |
-| `--debug` | — | `false` | Write diagnostic logs to stderr |
+| Command | Description |
+|---------|-------------|
+| `kusto-cli query '<kql>'` | Run a KQL query |
+| `kusto-cli command '.show tables'` | Run a management command |
+| `kusto-cli databases list` | List databases |
+| `kusto-cli tables list` | List tables |
+| `kusto-cli tables describe <table>` | Describe a table |
+| `kusto-cli tables sample <table> [size]` | Sample rows from a table |
+| `kusto-cli entities list <type>` | List entities by type |
+| `kusto-cli services list` | List configured services |
+| `kusto-cli deeplink '<kql>'` | Build a web explorer deeplink |
+| `kusto-cli queryplan '<kql>'` | Show query plan |
+| `kusto-cli diagnostics` | Run diagnostics |
+| `kusto-cli api tools` | List raw MCP tools |
+| `kusto-cli api schema <tool>` | Show raw MCP tool schema |
+| `kusto-cli api call <tool> '<json>'` | Call a raw MCP tool |
+
+## Output
+
+Direct commands support:
+
+```bash
+-o json
+-o table
+-o tsv
+```
+
+Example:
+
+```bash
+kusto-cli --service-uri https://help.kusto.windows.net --database Samples -o table query 'StormEvents | count'
+```
 
 ## Safety flags
 
@@ -112,35 +118,6 @@ Auth modes:
 | `--dry-run` | Preview write-capable direct calls without executing |
 | `--no-input` | Reserved for non-interactive consistency |
 | `--force` | Reserved for confirmation consistency |
-
-## Tools
-
-The MCP server exposes 13 Kusto tools:
-
-- `kusto_query`
-- `kusto_command`
-- `kusto_known_services`
-- `kusto_list_entities`
-- `kusto_describe_database`
-- `kusto_describe_database_entity`
-- `kusto_sample_entity`
-- `kusto_graph_query`
-- `kusto_ingest_inline_into_table`
-- `kusto_get_shots`
-- `kusto_deeplink_from_query`
-- `kusto_show_queryplan`
-- `kusto_diagnostics`
-
-## Agent usage
-
-Add this command as a stdio MCP server in your agent config:
-
-```json
-{
-  "command": "/absolute/path/to/kusto-cli",
-  "args": ["--service-uri", "https://help.kusto.windows.net", "--database", "Samples"]
-}
-```
 
 ## Documentation
 
