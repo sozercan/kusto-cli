@@ -55,7 +55,7 @@ brews:
       token: "{{ .Env.HOMEBREW_REPO_TOKEN }}"
     directory: Formula
     homepage: "https://github.com/sozercan/kusto-cli"
-    description: "Standalone MCP CLI for Kusto workflows"
+    description: "Standalone CLI for Kusto workflows"
     license: "MIT"
     install: |
       bin.install "kusto-cli"

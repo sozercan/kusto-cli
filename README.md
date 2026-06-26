@@ -1,6 +1,6 @@
 # kusto-cli
 
-Standalone, agent-friendly Go CLI for Kusto workflows. It provides human-readable subcommands and also includes a raw MCP API explorer for advanced automation.
+Standalone, agent-friendly Go CLI for Kusto workflows. It provides human-readable subcommands and also includes a advanced API explorer for advanced automation.
 
 It runs as a self-contained Go binary with standard environment and Azure CLI authentication options.
 
@@ -56,7 +56,7 @@ Sample rows:
 kusto-cli --service-uri https://help.kusto.windows.net --database Samples tables sample StormEvents 5
 ```
 
-Run as an MCP stdio server:
+Run as an stdio service:
 
 ```bash
 kusto-cli --service-uri https://help.kusto.windows.net --database Samples serve
@@ -90,9 +90,9 @@ kusto-cli auth status
 | `kusto-cli deeplink '<kql>'` | Build a web explorer deeplink |
 | `kusto-cli queryplan '<kql>'` | Show query plan |
 | `kusto-cli diagnostics` | Run diagnostics |
-| `kusto-cli api tools` | List raw MCP tools |
-| `kusto-cli api schema <tool>` | Show raw MCP tool schema |
-| `kusto-cli api call <tool> '<json>'` | Call a raw MCP tool |
+| `kusto-cli api tools` | List API tools |
+| `kusto-cli api schema <tool>` | Show API tool schema |
+| `kusto-cli api call <tool> '<json>'` | Call a API tool |
 
 ## Output
 
@@ -126,7 +126,7 @@ kusto-cli --service-uri https://help.kusto.windows.net --database Samples -o tab
 - [Configuration](docs/config.md)
 - [Safety](docs/safety.md)
 - [Release](docs/release.md)
-- [MCP protocol behavior](docs/mcp.md)
+- [Protocol behavior](docs/protocol.md)
 - [Architecture](docs/architecture.md)
 
 ## Development

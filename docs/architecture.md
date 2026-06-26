@@ -5,7 +5,7 @@ Agent or script
   └─ stdio JSON-RPC / direct command
       └─ kusto-cli
           ├─ token provider: env or Azure CLI
-          ├─ MCP tool registry
+          ├─ tool registry
           ├─ Kusto REST client
           └─ Kusto cluster
 ```
@@ -14,7 +14,7 @@ Agent or script
 
 The current implementation is intentionally small and standard-library only:
 
-- `cmd/kusto-cli/main.go` contains CLI parsing, MCP stdio serving, direct command mode, auth, Kusto REST calls, and result formatting.
+- `cmd/kusto-cli/main.go` contains CLI parsing, stdio serving, direct command mode, auth, Kusto REST calls, and result formatting.
 - `cmd/kusto-cli/main_test.go` covers validation, result parsing, request-property safety, and deeplink generation.
 
 ## Design choices

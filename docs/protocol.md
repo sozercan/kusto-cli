@@ -1,13 +1,13 @@
-# MCP behavior
+# Protocol behavior
 
-`kusto-cli` implements a local stdio MCP server.
+`kusto-cli` can run in stdio service mode for agent integrations.
 
 ## Startup sequence
 
-1. The agent sends `initialize` over stdio.
-2. `kusto-cli` returns server info, instructions, and tool capability metadata.
-3. The agent sends `notifications/initialized`.
-4. The agent can call `tools/list` and `tools/call`.
+1. The client sends an initialization request over stdio.
+2. `kusto-cli` returns server info, instructions, and tool metadata.
+3. The client sends an initialized notification.
+4. The client can list tools and call tools.
 
 ## Result format
 

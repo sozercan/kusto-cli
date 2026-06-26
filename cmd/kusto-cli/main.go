@@ -746,7 +746,7 @@ func (s *server) initializeResult(params json.RawMessage) any {
 	if len(params) > 0 && json.Unmarshal(params, &p) == nil && p.ProtocolVersion != "" {
 		protocol = p.ProtocolVersion
 	}
-	instructions := "Standalone Kusto MCP server — query and explore Azure Data Explorer / Microsoft Fabric Eventhouse (Kusto) clusters."
+	instructions := "Standalone Kusto CLI — query and explore Azure Data Explorer / Microsoft Fabric Eventhouse (Kusto) clusters."
 	if len(s.knownServices) > 0 {
 		var b strings.Builder
 		b.WriteString(instructions)
@@ -1243,7 +1243,7 @@ func toolDefinitions() []map[string]any {
 		tool("kusto_get_shots", "Retrieve simple KQL examples from a configured shots table; returns [] when none is configured.", with(map[string]any{"prompt": map[string]any{"type": "string"}, "embedding_endpoint": map[string]any{"type": []string{"string", "null"}}, "shots_table_name": map[string]any{"type": []string{"string", "null"}}, "sample_size": map[string]any{"type": []string{"integer", "null"}}}), []string{"prompt", "cluster_uri"}),
 		tool("kusto_graph_query", "Execute a graph query by wrapping the provided query with graph('<name>').", with(map[string]any{"graph_name": map[string]any{"type": "string"}, "query": map[string]any{"type": "string"}}), []string{"graph_name", "query", "cluster_uri"}),
 		tool("kusto_ingest_inline_into_table", "Ingest inline comma-separated data into a table. Destructive write operation.", with(map[string]any{"table_name": map[string]any{"type": "string"}, "data_comma_separator": map[string]any{"type": "string"}}), []string{"table_name", "data_comma_separator", "cluster_uri"}),
-		tool("kusto_known_services", "Retrieve the list of Kusto services known to this MCP.", map[string]any{}, []string{}),
+		tool("kusto_known_services", "Retrieve the list of Kusto services known to this CLI.", map[string]any{}, []string{}),
 		tool("kusto_list_entities", "List databases, tables, external-tables, materialized-views, functions, or graphs.", with(map[string]any{"entity_type": map[string]any{"type": "string"}}), []string{"cluster_uri", "entity_type"}),
 		tool("kusto_query", "Execute a KQL query. For management commands starting with '.', use kusto_command.", with(map[string]any{"query": map[string]any{"type": "string"}}), []string{"query", "cluster_uri"}),
 		tool("kusto_sample_entity", "Retrieve a data sample from an entity.", with(map[string]any{"entity_name": map[string]any{"type": "string"}, "entity_type": map[string]any{"type": "string"}, "sample_size": map[string]any{"type": []string{"integer", "null"}}}), []string{"entity_name", "entity_type", "cluster_uri"}),
