@@ -1,0 +1,67 @@
+version: 2
+
+project_name: kusto-cli
+
+before:
+  hooks:
+    - go test ./... -count=1
+
+builds:
+  - id: kusto-cli
+    main: ./cmd/kusto-cli
+    binary: kusto-cli
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w
+
+archives:
+  - id: default
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+
+brews:
+  - repository:
+      owner: sozercan
+      name: homebrew-repo
+      token: "{{ .Env.HOMEBREW_REPO_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/sozercan/kusto-cli"
+    description: "Standalone MCP CLI for Kusto workflows"
+    license: "MIT"
+    install: |
+      bin.install "kusto-cli"
+    test: |
+      system "#{bin}/kusto-cli", "--version"
+
+release:
+  github:
+    owner: sozercan
+    name: kusto-cli
+  name_template: "{{.Tag}}"

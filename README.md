@@ -6,6 +6,19 @@ It runs as a self-contained Go binary with standard environment and Azure CLI au
 
 ## Install
 
+### Homebrew
+
+```bash
+brew tap sozercan/repo
+brew install kusto-cli
+```
+
+### Prebuilt binaries
+
+Prebuilt archives for Linux, macOS, and Windows are published on the [GitHub Releases](https://github.com/sozercan/kusto-cli/releases) page. Each release includes `checksums.txt`.
+
+### From source
+
 ```bash
 go build -o bin/kusto-cli ./cmd/kusto-cli
 ```
