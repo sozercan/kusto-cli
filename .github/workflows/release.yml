@@ -8,6 +8,9 @@ on:
 permissions:
   contents: write
 
+env:
+  HOMEBREW_REPO_TOKEN: ${{ secrets.HOMEBREW_REPO_TOKEN }}
+
 jobs:
   release:
     runs-on: macos-latest
@@ -22,7 +25,8 @@ jobs:
           go-version: "1.26"
           cache: true
 
-      - name: Run GoReleaser
+      - name: Run GoReleaser with Homebrew
+        if: env.HOMEBREW_REPO_TOKEN != ''
         uses: goreleaser/goreleaser-action@ec59f474b9834571250b370d4735c50f8e2d1e29 # v7.0.0
         with:
           version: v2.15.4
@@ -30,3 +34,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_REPO_TOKEN: ${{ secrets.HOMEBREW_REPO_TOKEN }}
+
+      - name: Run GoReleaser without Homebrew
+        if: env.HOMEBREW_REPO_TOKEN == ''
+        uses: goreleaser/goreleaser-action@ec59f474b9834571250b370d4735c50f8e2d1e29 # v7.0.0
+        with:
+          version: v2.15.4
+          args: release --clean --skip=homebrew
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
