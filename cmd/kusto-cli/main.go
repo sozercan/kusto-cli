@@ -17,14 +17,16 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/sozercan/kusto-cli/internal/version"
 )
 
 const (
-	version              = "0.1.0"
 	defaultProtocolVer   = "2025-06-18"
 	defaultKustoDB       = "NetDefaultDB"
 	defaultKustoResource = "https://kusto.kusto.windows.net"
@@ -39,6 +41,11 @@ type config struct {
 	tenant        string
 	userAgent     string
 	timeout       time.Duration
+	output        string
+	allowWrite    bool
+	dryRun        bool
+	noInput       bool
+	force         bool
 	debug         bool
 	printVersion  bool
 	args          []string
@@ -109,7 +116,7 @@ type kustoResponse struct {
 func main() {
 	cfg := parseFlags()
 	if cfg.printVersion {
-		fmt.Printf("kusto-cli %s\n", version)
+		fmt.Printf("kusto-cli %s (%s)\n", version.Version, version.Commit)
 		return
 	}
 	log.SetOutput(os.Stderr)
@@ -128,12 +135,19 @@ func parseFlags() config {
 	flag.StringVar(&cfg.tokenEnv, "token-env", "KUSTO_ACCESS_TOKEN", "environment variable containing a Kusto bearer token")
 	flag.StringVar(&cfg.authMode, "auth", "auto", "auth mode: auto, env, azcli, none")
 	flag.StringVar(&cfg.tenant, "tenant", "", "optional Azure tenant id for az CLI token acquisition")
-	flag.StringVar(&cfg.userAgent, "user-agent", "kusto-cli/"+version, "User-Agent sent to Kusto")
+	flag.StringVar(&cfg.userAgent, "user-agent", "kusto-cli/"+version.Version, "User-Agent sent to Kusto")
 	flag.DurationVar(&cfg.timeout, "timeout", 90*time.Second, "Kusto HTTP timeout")
+	flag.StringVar(&cfg.output, "output", firstNonEmpty(os.Getenv("KUSTO_OUTPUT"), "json"), "Direct command output: json, table, or tsv")
+	flag.StringVar(&cfg.output, "o", firstNonEmpty(os.Getenv("KUSTO_OUTPUT"), "json"), "Alias for --output")
+	flag.BoolVar(&cfg.allowWrite, "allow-write", false, "Allow destructive Kusto operations")
+	flag.BoolVar(&cfg.dryRun, "dry-run", false, "Preview write operations without executing")
+	flag.BoolVar(&cfg.noInput, "no-input", false, "Never prompt; fail instead (reserved for scripting consistency)")
+	flag.BoolVar(&cfg.force, "force", false, "Skip confirmation prompts (reserved for scripting consistency)")
 	flag.BoolVar(&cfg.debug, "debug", false, "write debug logs to stderr")
 	flag.BoolVar(&cfg.printVersion, "version", false, "print version and exit")
 	flag.Parse()
 	cfg.args = flag.Args()
+	applyFileConfig(&cfg, visitedFlags())
 	return cfg
 }
 
@@ -196,7 +210,16 @@ func (s *server) loadKnownServices() error {
 func (s *server) runCommand(ctx context.Context, args []string) error {
 	switch args[0] {
 	case "tools":
-		return writePretty(os.Stdout, map[string]any{"tools": toolDefinitions()})
+		return writeOutput(os.Stdout, s.cfg.output, map[string]any{"tools": toolDefinitions()})
+	case "schema":
+		if len(args) < 2 {
+			return errors.New("usage: kusto-cli schema <tool-name>")
+		}
+		tool, err := findToolDefinition(args[1])
+		if err != nil {
+			return err
+		}
+		return writeOutput(os.Stdout, s.cfg.output, tool)
 	case "call":
 		if len(args) < 3 {
 			return errors.New("usage: kusto-cli call <tool-name> '<json-arguments>'")
@@ -205,7 +228,7 @@ func (s *server) runCommand(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		return writeJSONText(os.Stdout, text)
+		return writeDirectText(os.Stdout, s.cfg.output, text)
 	case "query":
 		if len(args) < 2 {
 			return errors.New("usage: kusto-cli query '<kql>'")
@@ -215,7 +238,7 @@ func (s *server) runCommand(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		return writeJSONText(os.Stdout, text)
+		return writeDirectText(os.Stdout, s.cfg.output, text)
 	case "command":
 		if len(args) < 2 {
 			return errors.New("usage: kusto-cli command '<management-command>'")
@@ -225,31 +248,285 @@ func (s *server) runCommand(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		return writeJSONText(os.Stdout, text)
+		return writeDirectText(os.Stdout, s.cfg.output, text)
+	case "auth":
+		return s.runAuthCommand(ctx, args[1:])
+	case "config":
+		return runConfigCommand("kusto-cli", args[1:])
+	case "completion":
+		return runCompletionCommand("kusto-cli", args[1:])
 	default:
-		return fmt.Errorf("unknown command %q (expected: serve, tools, call, query, command)", args[0])
+		return fmt.Errorf("unknown command %q (expected: serve, tools, schema, call, query, command, auth, config, completion)", args[0])
+	}
+}
+
+func findToolDefinition(name string) (map[string]any, error) {
+	for _, tool := range toolDefinitions() {
+		if toolName, _ := tool["name"].(string); toolName == name {
+			return tool, nil
+		}
+	}
+	return nil, fmt.Errorf("tool %q not found", name)
+}
+
+func (s *server) runAuthCommand(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: kusto-cli auth <status|token>")
+	}
+	switch args[0] {
+	case "status":
+		_, err := s.auth.get(ctx)
+		return writeOutput(os.Stdout, s.cfg.output, map[string]any{"authenticated": err == nil, "mode": s.cfg.authMode, "token_env": s.cfg.tokenEnv, "error": errorString(err)})
+	case "token":
+		tok, err := s.auth.get(ctx)
+		if err != nil {
+			return err
+		}
+		return writeOutput(os.Stdout, s.cfg.output, map[string]any{"accessToken": tok, "tokenType": "Bearer"})
+	default:
+		return fmt.Errorf("unknown auth command %q (expected: status, token)", args[0])
 	}
 }
 
 func writePretty(w io.Writer, v any) error {
-	enc := json.NewEncoder(w)
-	enc.SetEscapeHTML(false)
-	enc.SetIndent("", "  ")
-	return enc.Encode(v)
+	return writeOutput(w, "json", v)
 }
 
-func writeJSONText(w io.Writer, text string) error {
+func writeOutput(w io.Writer, format string, v any) error {
+	switch strings.ToLower(format) {
+	case "", "json":
+		enc := json.NewEncoder(w)
+		enc.SetEscapeHTML(false)
+		enc.SetIndent("", "  ")
+		return enc.Encode(v)
+	case "table":
+		return writeHuman(w, v, "")
+	case "tsv", "plain":
+		return writeTSV(w, v)
+	default:
+		return fmt.Errorf("unknown output format %q", format)
+	}
+}
+
+func writeDirectText(w io.Writer, format string, text string) error {
+	var kr kustoResponse
+	if err := json.Unmarshal([]byte(text), &kr); err == nil && kr.Format == "kusto_response" {
+		switch strings.ToLower(format) {
+		case "table":
+			return writeKustoTable(w, kr)
+		case "tsv", "plain":
+			return writeKustoTSV(w, kr)
+		default:
+			return writeOutput(w, "json", kr)
+		}
+	}
 	var v any
 	if err := json.Unmarshal([]byte(text), &v); err == nil {
-		return writePretty(w, v)
+		return writeOutput(w, format, v)
 	}
 	_, err := fmt.Fprintln(w, text)
 	return err
 }
 
+func writeKustoTable(w io.Writer, kr kustoResponse) error {
+	if len(kr.Data.Columns) == 0 {
+		fmt.Fprintln(w, "(no columns)")
+		return nil
+	}
+	for i, c := range kr.Data.Columns {
+		if i > 0 {
+			fmt.Fprint(w, "\t")
+		}
+		fmt.Fprint(w, c.ColumnName)
+	}
+	fmt.Fprintln(w)
+	for _, row := range kr.Data.Rows {
+		for i := range kr.Data.Columns {
+			if i > 0 {
+				fmt.Fprint(w, "\t")
+			}
+			if i < len(row) {
+				fmt.Fprint(w, row[i])
+			}
+		}
+		fmt.Fprintln(w)
+	}
+	return nil
+}
+
+func writeKustoTSV(w io.Writer, kr kustoResponse) error { return writeKustoTable(w, kr) }
+
+func writeHuman(w io.Writer, v any, indent string) error {
+	switch x := v.(type) {
+	case map[string]any:
+		for k, val := range x {
+			fmt.Fprintf(w, "%s%s: ", indent, k)
+			switch val.(type) {
+			case map[string]any, []any:
+				fmt.Fprintln(w)
+				if err := writeHuman(w, val, indent+"  "); err != nil {
+					return err
+				}
+			default:
+				fmt.Fprintln(w, val)
+			}
+		}
+	case []any:
+		for i, item := range x {
+			fmt.Fprintf(w, "%s- [%d]\n", indent, i)
+			if err := writeHuman(w, item, indent+"  "); err != nil {
+				return err
+			}
+		}
+	default:
+		fmt.Fprintln(w, x)
+	}
+	return nil
+}
+
+func writeTSV(w io.Writer, v any) error {
+	b, _ := json.Marshal(v)
+	var generic any
+	if err := json.Unmarshal(b, &generic); err != nil {
+		return err
+	}
+	if m, ok := generic.(map[string]any); ok {
+		for k, val := range m {
+			fmt.Fprintf(w, "%s\t%v\n", k, val)
+		}
+		return nil
+	}
+	fmt.Fprintln(w, generic)
+	return nil
+}
+
 func mustMarshal(v any) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return json.RawMessage(b)
+}
+
+func visitedFlags() map[string]bool {
+	seen := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { seen[f.Name] = true })
+	return seen
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func configFilePath(app string) (string, error) {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, app, "config.json"), nil
+}
+
+func loadConfigMap(app string) map[string]string {
+	path, err := configFilePath(app)
+	if err != nil {
+		return map[string]string{}
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return map[string]string{}
+	}
+	var cfg map[string]string
+	if json.Unmarshal(b, &cfg) != nil {
+		return map[string]string{}
+	}
+	return cfg
+}
+
+func saveConfigMap(app string, cfg map[string]string) error {
+	path, err := configFilePath(app)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	b, _ := json.MarshalIndent(cfg, "", "  ")
+	b = append(b, '\n')
+	return os.WriteFile(path, b, 0o600)
+}
+
+func applyFileConfig(cfg *config, visited map[string]bool) {
+	fileCfg := loadConfigMap("kusto-cli")
+	if !visited["service-uri"] && !visited["service-url"] && os.Getenv("KUSTO_SERVICE_URI") == "" && fileCfg["service-uri"] != "" {
+		cfg.serviceURI = fileCfg["service-uri"]
+	}
+	if !visited["database"] && os.Getenv("KUSTO_SERVICE_DEFAULT_DB") == "" && fileCfg["database"] != "" {
+		cfg.database = fileCfg["database"]
+	}
+	if !visited["known-services"] && os.Getenv("KUSTO_KNOWN_SERVICES") == "" && fileCfg["known-services"] != "" {
+		cfg.knownServices = fileCfg["known-services"]
+	}
+	if !visited["tenant"] && fileCfg["tenant"] != "" {
+		cfg.tenant = fileCfg["tenant"]
+	}
+	if !visited["auth"] && fileCfg["auth"] != "" {
+		cfg.authMode = fileCfg["auth"]
+	}
+	if !visited["output"] && !visited["o"] && os.Getenv("KUSTO_OUTPUT") == "" && fileCfg["output"] != "" {
+		cfg.output = fileCfg["output"]
+	}
+}
+
+func runConfigCommand(app string, args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: config <path|show|set|unset>")
+	}
+	cfg := loadConfigMap(app)
+	switch args[0] {
+	case "path":
+		path, err := configFilePath(app)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(os.Stdout, path)
+		return nil
+	case "show":
+		return writeOutput(os.Stdout, "json", cfg)
+	case "set":
+		if len(args) < 3 {
+			return errors.New("usage: config set <key> <value>")
+		}
+		cfg[args[1]] = args[2]
+		return saveConfigMap(app, cfg)
+	case "unset":
+		if len(args) < 2 {
+			return errors.New("usage: config unset <key>")
+		}
+		delete(cfg, args[1])
+		return saveConfigMap(app, cfg)
+	default:
+		return fmt.Errorf("unknown config command %q", args[0])
+	}
+}
+
+func runCompletionCommand(name string, args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: completion <bash|zsh|fish>")
+	}
+	commands := "serve tools schema call query command auth config completion"
+	switch args[0] {
+	case "bash":
+		fmt.Fprintf(os.Stdout, "complete -W %q %s\n", commands, name)
+	case "zsh":
+		fmt.Fprintf(os.Stdout, "#compdef %s\n_arguments '1:command:(%s)'\n", name, commands)
+	case "fish":
+		for _, c := range strings.Fields(commands) {
+			fmt.Fprintf(os.Stdout, "complete -c %s -f -a %s\n", name, c)
+		}
+	default:
+		return fmt.Errorf("unknown shell %q", args[0])
+	}
+	return nil
 }
 
 func (s *server) serveStdio(ctx context.Context, r io.Reader, w io.Writer) error {
@@ -336,7 +613,7 @@ func (s *server) initializeResult(params json.RawMessage) any {
 	return map[string]any{
 		"protocolVersion": protocol,
 		"capabilities":    map[string]any{"tools": map[string]any{}},
-		"serverInfo":      map[string]any{"name": "kusto-cli", "version": version},
+		"serverInfo":      map[string]any{"name": "kusto-cli", "version": version.Version},
 		"instructions":    instructions,
 	}
 }
@@ -366,7 +643,14 @@ func (s *server) callTool(ctx context.Context, name string, raw json.RawMessage)
 		if err := validateCommand(a.Command); err != nil {
 			return "", err
 		}
-		resp, err := s.execute(ctx, a.ClusterURI, a.Database, a.Command, "mgmt", false, a.ClientRequestProperties)
+		readonly := isSafeManagementCommand(a.Command)
+		if !readonly && !s.cfg.allowWrite {
+			if s.cfg.dryRun {
+				return marshalText(map[string]any{"dry_run": true, "tool": "kusto_command", "command": a.Command})
+			}
+			return "", errors.New("destructive management commands require --allow-write")
+		}
+		resp, err := s.execute(ctx, a.ClusterURI, a.Database, a.Command, "mgmt", readonly, a.ClientRequestProperties)
 		return marshalKusto(resp, err)
 	case "kusto_deeplink_from_query":
 		var a deeplinkArgs
@@ -448,6 +732,12 @@ func (s *server) callTool(ctx context.Context, name string, raw json.RawMessage)
 			return "", errors.New("table_name and data_comma_separator are required")
 		}
 		cmd := ".ingest inline into table " + kqlEscapeEntityName(a.TableName) + " <| " + a.DataCommaSeparator
+		if !s.cfg.allowWrite {
+			if s.cfg.dryRun {
+				return marshalText(map[string]any{"dry_run": true, "tool": "kusto_ingest_inline_into_table", "table_name": a.TableName})
+			}
+			return "", errors.New("inline ingestion requires --allow-write")
+		}
 		resp, err := s.execute(ctx, a.ClusterURI, a.Database, cmd, "mgmt", false, a.ClientRequestProperties)
 		return marshalKusto(resp, err)
 	case "kusto_get_shots":
@@ -803,6 +1093,11 @@ func toolDefinitions() []map[string]any {
 		tool("kusto_sample_entity", "Retrieve a data sample from an entity.", with(map[string]any{"entity_name": map[string]any{"type": "string"}, "entity_type": map[string]any{"type": "string"}, "sample_size": map[string]any{"type": []string{"integer", "null"}}}), []string{"entity_name", "entity_type", "cluster_uri"}),
 		tool("kusto_show_queryplan", "Retrieve the query execution plan without running the query.", with(map[string]any{"query": map[string]any{"type": "string"}}), []string{"query", "cluster_uri"}),
 	}
+}
+
+func isSafeManagementCommand(c string) bool {
+	stmt := strings.ToLower(firstStatement(c))
+	return strings.HasPrefix(stmt, ".show")
 }
 
 func validateQuery(q string) error {

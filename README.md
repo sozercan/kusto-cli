@@ -46,6 +46,18 @@ List available MCP tools as JSON:
 bin/kusto-cli tools
 ```
 
+Inspect a single tool schema:
+
+```bash
+bin/kusto-cli schema kusto_query
+```
+
+Generate shell completion:
+
+```bash
+bin/kusto-cli completion zsh
+```
+
 Call any MCP tool directly:
 
 ```bash
@@ -92,6 +104,15 @@ Auth modes:
 | `--timeout` | — | `90s` | HTTP and TLS handshake timeout |
 | `--debug` | — | `false` | Write diagnostic logs to stderr |
 
+## Safety flags
+
+| Flag | Description |
+|------|-------------|
+| `--allow-write` | Allow write-capable operations such as inline ingestion and non-`.show` management commands |
+| `--dry-run` | Preview write-capable direct calls without executing |
+| `--no-input` | Reserved for non-interactive consistency |
+| `--force` | Reserved for confirmation consistency |
+
 ## Tools
 
 The MCP server exposes 13 Kusto tools:
@@ -124,6 +145,10 @@ Add this command as a stdio MCP server in your agent config:
 ## Documentation
 
 - [Agent guide](docs/agent-guide.md)
+- [Authentication](docs/auth.md)
+- [Configuration](docs/config.md)
+- [Safety](docs/safety.md)
+- [Release](docs/release.md)
 - [MCP protocol behavior](docs/mcp.md)
 - [Architecture](docs/architecture.md)
 

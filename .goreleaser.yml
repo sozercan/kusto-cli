@@ -24,6 +24,8 @@ builds:
         goarch: arm64
     ldflags:
       - -s -w
+      - -X github.com/sozercan/kusto-cli/internal/version.Version={{.Version}}
+      - -X github.com/sozercan/kusto-cli/internal/version.Commit={{.ShortCommit}}
 
 archives:
   - id: default
