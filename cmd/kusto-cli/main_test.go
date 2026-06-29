@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -374,6 +375,202 @@ func TestAskUsesFakedQueryDraftAgentAndWritesStableJSON(t *testing.T) {
 	}
 	if strings.Contains(out.String(), "Hail") {
 		t.Fatal("ask output included raw sample row values without explicit opt-in")
+	}
+}
+
+func TestAskGenerateOnlyDoesNotExecuteWithoutExecutionGate(t *testing.T) {
+	var out bytes.Buffer
+	agent := &recordingQueryDraftAgent{}
+	executed := false
+	s := &server{
+		cfg:              config{serviceURI: "https://help.kusto.windows.net", database: "Samples", output: "json"},
+		queryDraftAgent:  agent,
+		schemaDiscoverer: &fakeSchemaDiscoverer{ctx: fakeStormSchemaContext()},
+		executeHook: func(context.Context, string, string, string, string, bool, map[string]any) (kustoResponse, error) {
+			executed = true
+			return kustoResponse{}, nil
+		},
+		stdout: &out,
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.runCommand(context.Background(), []string{"ask", "show", "recent", "storm", "events"}); err != nil {
+		t.Fatal(err)
+	}
+	if executed {
+		t.Fatal("generate-only ask executed generated KQL without the Execution Gate")
+	}
+	var draft queryDraft
+	if err := json.Unmarshal(out.Bytes(), &draft); err != nil {
+		t.Fatalf("unmarshal Query Draft: %v\n%s", err, out.String())
+	}
+	if draft.Execution.Executed {
+		t.Fatalf("execution = %#v; want generate-only not executed", draft.Execution)
+	}
+	if !strings.Contains(draft.Execution.Reason, "execution requires an explicit execution gate") {
+		t.Fatalf("execution reason = %q; want explicit gate message", draft.Execution.Reason)
+	}
+	if draft.Execution.Result != nil {
+		t.Fatalf("execution result = %#v; want none in generate-only mode", draft.Execution.Result)
+	}
+}
+
+func TestAskExecuteRequiresPassedValidation(t *testing.T) {
+	var out bytes.Buffer
+	agent := &scriptedQueryDraftAgent{draft: queryDraft{Query: "StormEvents | where State == 'WA'"}}
+	executed := false
+	s := &server{
+		cfg:              config{serviceURI: "https://help.kusto.windows.net", database: "Samples", output: "json"},
+		queryDraftAgent:  agent,
+		schemaDiscoverer: &fakeSchemaDiscoverer{ctx: fakeStormSchemaContext()},
+		executeHook: func(context.Context, string, string, string, string, bool, map[string]any) (kustoResponse, error) {
+			executed = true
+			return kustoResponse{}, nil
+		},
+		stdout: &out,
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.runCommand(context.Background(), []string{"ask", "--execute", "show", "storm", "events"}); err != nil {
+		t.Fatal(err)
+	}
+	if executed {
+		t.Fatal("ask --execute executed a Query Draft that did not pass validation")
+	}
+	var draft queryDraft
+	if err := json.Unmarshal(out.Bytes(), &draft); err != nil {
+		t.Fatalf("unmarshal Query Draft: %v\n%s", err, out.String())
+	}
+	if draft.Validation.Status != "warning" || draft.Validation.SafeForExecution {
+		t.Fatalf("validation = %#v; want warning and not safe for execution", draft.Validation)
+	}
+	if draft.Execution.Executed || draft.Execution.Status != "blocked" {
+		t.Fatalf("execution = %#v; want blocked without execution", draft.Execution)
+	}
+	if draft.Execution.MaxRecords != defaultAskExecutionMaxRecords {
+		t.Fatalf("execution max_records = %d; want default %d", draft.Execution.MaxRecords, defaultAskExecutionMaxRecords)
+	}
+	if !strings.Contains(draft.Execution.Reason, "Execution Gate requested") || !strings.Contains(draft.Execution.Reason, "result bound") {
+		t.Fatalf("execution reason = %q; want validation block details", draft.Execution.Reason)
+	}
+}
+
+func TestAskExecuteAppliesReadonlyAndRecordLimitsAndIncludesResult(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		wantMax int
+	}{
+		{name: "default max records", args: []string{"ask", "--execute", "show", "storm", "events"}, wantMax: defaultAskExecutionMaxRecords},
+		{name: "custom max records", args: []string{"ask", "--execute", "--max-rows", "7", "show", "storm", "events"}, wantMax: 7},
+		{name: "custom execute max records alias", args: []string{"ask", "--execute", "--execute-max-rows=8", "show", "storm", "events"}, wantMax: 8},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			agent := &recordingQueryDraftAgent{}
+			var called int
+			var gotCluster, gotDatabase, gotQuery, gotKind string
+			var gotReadonly bool
+			var gotOptions map[string]any
+			s := &server{
+				cfg:              config{serviceURI: "https://help.kusto.windows.net", database: "Samples", output: "json"},
+				queryDraftAgent:  agent,
+				schemaDiscoverer: &fakeSchemaDiscoverer{ctx: fakeStormSchemaContext()},
+				executeHook: func(_ context.Context, clusterURI, database, csl, kind string, readonly bool, crp map[string]any) (kustoResponse, error) {
+					called++
+					gotCluster, gotDatabase, gotQuery, gotKind = clusterURI, database, csl, kind
+					gotReadonly = readonly
+					props, err := buildRequestProperties(readonly, crp)
+					if err != nil {
+						return kustoResponse{}, err
+					}
+					gotOptions = props["Options"].(map[string]any)
+					return makeKustoResponse(
+						[]kustoColumn{{ColumnName: "EventType", ColumnType: "string"}},
+						[][]any{{"Hail"}},
+					), nil
+				},
+				stdout: &out,
+			}
+			if err := s.loadKnownServices(); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.runCommand(context.Background(), tc.args); err != nil {
+				t.Fatal(err)
+			}
+			if called != 1 {
+				t.Fatalf("execute calls = %d; want 1", called)
+			}
+			if gotCluster != "https://help.kusto.windows.net" || gotDatabase != "Samples" || gotQuery != "StormEvents | take 5" || gotKind != "query" {
+				t.Fatalf("execution args = cluster=%q database=%q query=%q kind=%q", gotCluster, gotDatabase, gotQuery, gotKind)
+			}
+			if !gotReadonly {
+				t.Fatal("ask --execute did not use the read-only execution path")
+			}
+			if gotOptions["request_readonly"] != true || gotOptions["request_readonly_hardline"] != true {
+				t.Fatalf("request options = %#v; want read-only hardline properties", gotOptions)
+			}
+			if gotOptions["query_take_max_records"] != tc.wantMax {
+				t.Fatalf("query_take_max_records = %#v; want %d", gotOptions["query_take_max_records"], tc.wantMax)
+			}
+			if agent.req.DataDisclosure.Sent.QueryResults {
+				t.Fatal("query results were marked as sent to model provider before execution")
+			}
+			var draft queryDraft
+			if err := json.Unmarshal(out.Bytes(), &draft); err != nil {
+				t.Fatalf("unmarshal Query Draft: %v\n%s", err, out.String())
+			}
+			if !draft.Execution.Executed || draft.Execution.Status != "succeeded" || draft.Execution.Result == nil {
+				t.Fatalf("execution = %#v; want succeeded result", draft.Execution)
+			}
+			if draft.Execution.MaxRecords != tc.wantMax {
+				t.Fatalf("execution max_records = %d; want %d", draft.Execution.MaxRecords, tc.wantMax)
+			}
+			if len(draft.Execution.Result.Data.Rows) != 1 || draft.Execution.Result.Data.Rows[0][0] != "Hail" {
+				t.Fatalf("execution result = %#v; want returned Kusto row", draft.Execution.Result)
+			}
+			if draft.DataDisclosure.Sent.QueryResults {
+				t.Fatal("Query Draft reported query results sent to the model provider")
+			}
+		})
+	}
+}
+
+func TestAskExecuteFailureReturnsQueryDraftWithMetadata(t *testing.T) {
+	var out bytes.Buffer
+	agent := &recordingQueryDraftAgent{}
+	s := &server{
+		cfg:              config{serviceURI: "https://help.kusto.windows.net", database: "Samples", output: "json"},
+		queryDraftAgent:  agent,
+		schemaDiscoverer: &fakeSchemaDiscoverer{ctx: fakeStormSchemaContext()},
+		executeHook: func(context.Context, string, string, string, string, bool, map[string]any) (kustoResponse, error) {
+			return kustoResponse{}, errors.New("synthetic Kusto failure")
+		},
+		stdout: &out,
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.runCommand(context.Background(), []string{"ask", "--execute", "show", "storm", "events"}); err != nil {
+		t.Fatal(err)
+	}
+	var draft queryDraft
+	if err := json.Unmarshal(out.Bytes(), &draft); err != nil {
+		t.Fatalf("unmarshal Query Draft: %v\n%s", err, out.String())
+	}
+	if draft.Query != "StormEvents | take 5" {
+		t.Fatalf("query = %q; want generated query preserved", draft.Query)
+	}
+	if draft.Validation.Status != "passed" || !draft.Validation.SafeForExecution {
+		t.Fatalf("validation = %#v; want generated validation metadata preserved", draft.Validation)
+	}
+	if !draft.Execution.Executed || draft.Execution.Status != "failed" || !strings.Contains(draft.Execution.Error, "synthetic Kusto failure") {
+		t.Fatalf("execution = %#v; want explicit execution failure metadata", draft.Execution)
+	}
+	if !containsString(draft.Warnings, "Execution Gate attempted query execution") {
+		t.Fatalf("warnings = %#v; want execution failure warning", draft.Warnings)
 	}
 }
 

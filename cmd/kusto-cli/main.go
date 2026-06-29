@@ -37,6 +37,7 @@ const (
 	dataDisclosureModeSchemaAndSamples = "schema-and-sample-rows"
 
 	defaultSchemaContextSampleRows = 3
+	defaultAskExecutionMaxRecords  = 100
 	maxSchemaContextTables         = 5
 	maxSchemaContextFunctions      = 3
 	maxSchemaContextColumns        = 24
@@ -75,6 +76,7 @@ type server struct {
 	auth             *tokenProvider
 	queryDraftAgent  queryDraftAgent
 	schemaDiscoverer schemaDiscoverer
+	executeHook      kustoExecuteFunc
 	stdout           io.Writer
 	knownServices    []KustoServiceConfig
 	defaultSvc       *KustoServiceConfig
@@ -232,9 +234,15 @@ type queryDraftValidationCheck struct {
 }
 
 type queryDraftExecution struct {
-	Executed bool   `json:"executed"`
-	Reason   string `json:"reason"`
+	Executed   bool           `json:"executed"`
+	Reason     string         `json:"reason"`
+	Status     string         `json:"status,omitempty"`
+	MaxRecords int            `json:"max_records,omitempty"`
+	Error      string         `json:"error,omitempty"`
+	Result     *kustoResponse `json:"result,omitempty"`
 }
+
+type kustoExecuteFunc func(ctx context.Context, clusterURI, database, csl, kind string, readonly bool, crp map[string]any) (kustoResponse, error)
 
 type queryDraftAgent interface {
 	GenerateQueryDraft(context.Context, queryDraftRequest) (queryDraft, error)
@@ -421,6 +429,8 @@ type askTargetSelection struct {
 	ServiceURISet     bool
 	DatabaseSet       bool
 	IncludeSampleRows bool
+	Execute           bool
+	MaxRecords        int
 }
 
 type askTargetCandidate struct {
@@ -454,6 +464,7 @@ func (s *server) runAskCommand(ctx context.Context, args []string) error {
 	if schemaErr != nil {
 		draft.Warnings = append(draft.Warnings, "Schema Context discovery failed; Query Draft may be less accurate: "+schemaErr.Error())
 	}
+	s.applyExecutionGate(ctx, &draft, selection)
 	return writeQueryDraft(s.output(), s.cfg.output, draft)
 }
 
@@ -513,6 +524,40 @@ func parseAskArgs(args []string) (askTargetSelection, string, error) {
 			selection.Database = strings.TrimPrefix(arg, "--database=")
 			selection.DatabaseSet = true
 			i++
+		case arg == "--execute":
+			selection.Execute = true
+			i++
+		case strings.HasPrefix(arg, "--execute="):
+			value, err := strconv.ParseBool(strings.TrimPrefix(arg, "--execute="))
+			if err != nil {
+				return selection, "", fmt.Errorf("--execute requires a boolean value: %w", err)
+			}
+			selection.Execute = value
+			i++
+		case arg == "--max-rows" || arg == "--execute-max-rows":
+			if i+1 >= len(args) {
+				return selection, "", fmt.Errorf("%s requires a value", arg)
+			}
+			maxRecords, err := parseAskExecutionMaxRecords(args[i+1], arg)
+			if err != nil {
+				return selection, "", err
+			}
+			selection.MaxRecords = maxRecords
+			i += 2
+		case strings.HasPrefix(arg, "--max-rows="):
+			maxRecords, err := parseAskExecutionMaxRecords(strings.TrimPrefix(arg, "--max-rows="), "--max-rows")
+			if err != nil {
+				return selection, "", err
+			}
+			selection.MaxRecords = maxRecords
+			i++
+		case strings.HasPrefix(arg, "--execute-max-rows="):
+			maxRecords, err := parseAskExecutionMaxRecords(strings.TrimPrefix(arg, "--execute-max-rows="), "--execute-max-rows")
+			if err != nil {
+				return selection, "", err
+			}
+			selection.MaxRecords = maxRecords
+			i++
 		case arg == "--include-samples" || arg == "--include-sample-rows":
 			selection.IncludeSampleRows = true
 			i++
@@ -540,6 +585,17 @@ func parseAskArgs(args []string) (askTargetSelection, string, error) {
 		return selection, "", errors.New("usage: kusto-cli ask '<natural-language prompt>'")
 	}
 	return selection, prompt, nil
+}
+
+func parseAskExecutionMaxRecords(value, flagName string) (int, error) {
+	maxRecords, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return 0, fmt.Errorf("%s requires an integer value: %w", flagName, err)
+	}
+	if maxRecords <= 0 {
+		return 0, fmt.Errorf("%s requires a value greater than zero", flagName)
+	}
+	return maxRecords, nil
 }
 
 func (s *server) queryDraftTarget(selection askTargetSelection) (queryDraftTarget, error) {
@@ -723,6 +779,7 @@ func normalizeQueryDraft(draft *queryDraft, req queryDraftRequest) {
 	if draft.DataDisclosure.Mode == "" {
 		draft.DataDisclosure = buildDataDisclosureReport(false, queryDraftSchemaContext{})
 	}
+	draft.DataDisclosure.Sent.QueryResults = false
 	draft.ClarificationQuestion = strings.TrimSpace(draft.ClarificationQuestion)
 	if draft.ModelSafety != nil && (draft.ModelSafety.Classification != "" || draft.ModelSafety.Reason != "") {
 		draft.ModelSafety.Advisory = true
@@ -737,10 +794,60 @@ func normalizeQueryDraft(draft *queryDraft, req queryDraftRequest) {
 	default:
 		draft.Warnings = append(draft.Warnings, "Generated query failed safety validation; do not execute it until corrected.")
 	}
-	draft.Execution.Executed = false
-	if draft.Execution.Reason == "" {
-		draft.Execution.Reason = queryDraftExecutionReason(draft.Validation)
+	draft.Execution = queryDraftExecution{Executed: false, Reason: queryDraftExecutionReason(draft.Validation)}
+}
+
+func (s *server) applyExecutionGate(ctx context.Context, draft *queryDraft, selection askTargetSelection) {
+	if draft == nil || !selection.Execute {
+		return
 	}
+	maxRecords := askExecutionMaxRecords(selection)
+	draft.Execution.MaxRecords = maxRecords
+	if !draft.Validation.SafeForExecution {
+		draft.Execution.Executed = false
+		draft.Execution.Status = "blocked"
+		draft.Execution.Reason = "blocked: Execution Gate requested, but Query Draft validation did not pass"
+		if len(draft.Validation.Errors) > 0 {
+			draft.Execution.Reason += ": " + strings.Join(draft.Validation.Errors, "; ")
+		} else if len(draft.Validation.Warnings) > 0 {
+			draft.Execution.Reason += ": " + strings.Join(draft.Validation.Warnings, "; ")
+		}
+		return
+	}
+	resp, err := s.executeKusto(ctx, draft.Target.ClusterURI, draft.Target.Database, draft.Query, "query", true, askExecutionClientRequestProperties(maxRecords))
+	draft.Execution.Executed = true
+	draft.Execution.MaxRecords = maxRecords
+	if err != nil {
+		draft.Execution.Status = "failed"
+		draft.Execution.Reason = "execution failed after explicit Execution Gate"
+		draft.Execution.Error = err.Error()
+		draft.Warnings = append(draft.Warnings, "Execution Gate attempted query execution, but execution failed: "+err.Error())
+		return
+	}
+	draft.Execution.Status = "succeeded"
+	draft.Execution.Reason = "executed after explicit Execution Gate"
+	draft.Execution.Result = &resp
+}
+
+func askExecutionMaxRecords(selection askTargetSelection) int {
+	if selection.MaxRecords > 0 {
+		return selection.MaxRecords
+	}
+	return defaultAskExecutionMaxRecords
+}
+
+func askExecutionClientRequestProperties(maxRecords int) map[string]any {
+	if maxRecords <= 0 {
+		maxRecords = defaultAskExecutionMaxRecords
+	}
+	return map[string]any{"query_take_max_records": maxRecords}
+}
+
+func (s *server) executeKusto(ctx context.Context, clusterURI, database, csl, kind string, readonly bool, crp map[string]any) (kustoResponse, error) {
+	if s.executeHook != nil {
+		return s.executeHook(ctx, clusterURI, database, csl, kind, readonly, crp)
+	}
+	return s.execute(ctx, clusterURI, database, csl, kind, readonly, crp)
 }
 
 func (s *server) discoverQueryDraftSchemaContext(ctx context.Context, target queryDraftTarget, prompt string, selection askTargetSelection) (queryDraftSchemaContext, error) {
@@ -1842,8 +1949,8 @@ func (s *server) runAPICommand(ctx context.Context, args []string) error {
 
 func printKustoUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
-  kusto-cli --service-uri <cluster> --database <db> ask [--include-samples] '<natural-language prompt>'
-  kusto-cli --target <alias> ask [--include-samples] '<natural-language prompt>'
+  kusto-cli --service-uri <cluster> --database <db> ask [--include-samples] [--execute] [--max-rows N] '<natural-language prompt>'
+  kusto-cli --target <alias> ask [--include-samples] [--execute] [--max-rows N] '<natural-language prompt>'
   kusto-cli --service-uri <cluster> --database <db> query '<kql>'
   kusto-cli databases list
   kusto-cli tables list
@@ -1942,7 +2049,24 @@ func writeQueryDraft(w io.Writer, format string, draft queryDraft) error {
 			}
 			fmt.Fprintf(w, "- %s: %s (%s)\n", check.Name, status, check.Message)
 		}
-		fmt.Fprintf(w, "Execution: not executed (%s)\n", draft.Execution.Reason)
+		if draft.Execution.Executed {
+			fmt.Fprintf(w, "Execution: executed (%s)\n", draft.Execution.Reason)
+		} else {
+			fmt.Fprintf(w, "Execution: not executed (%s)\n", draft.Execution.Reason)
+		}
+		if draft.Execution.Status != "" {
+			fmt.Fprintf(w, "Execution Status: %s\n", draft.Execution.Status)
+		}
+		if draft.Execution.MaxRecords > 0 {
+			fmt.Fprintf(w, "Execution Max Records: %d\n", draft.Execution.MaxRecords)
+		}
+		if draft.Execution.Error != "" {
+			fmt.Fprintf(w, "Execution Error: %s\n", draft.Execution.Error)
+		}
+		if draft.Execution.Result != nil {
+			fmt.Fprintln(w, "Execution Result:")
+			return writeKustoTable(w, *draft.Execution.Result)
+		}
 		return nil
 	case "tsv", "plain":
 		fmt.Fprintf(w, "format\t%s\n", oneLine(draft.Format))
@@ -1975,6 +2099,18 @@ func writeQueryDraft(w io.Writer, format string, draft queryDraft) error {
 		fmt.Fprintf(w, "validation.errors\t%s\n", oneLine(strings.Join(draft.Validation.Errors, "; ")))
 		fmt.Fprintf(w, "execution.executed\t%t\n", draft.Execution.Executed)
 		fmt.Fprintf(w, "execution.reason\t%s\n", oneLine(draft.Execution.Reason))
+		if draft.Execution.Status != "" {
+			fmt.Fprintf(w, "execution.status\t%s\n", oneLine(draft.Execution.Status))
+		}
+		if draft.Execution.MaxRecords > 0 {
+			fmt.Fprintf(w, "execution.max_records\t%d\n", draft.Execution.MaxRecords)
+		}
+		if draft.Execution.Error != "" {
+			fmt.Fprintf(w, "execution.error\t%s\n", oneLine(draft.Execution.Error))
+		}
+		if draft.Execution.Result != nil {
+			fmt.Fprintf(w, "execution.result\t%s\n", oneLine(string(mustJSON(draft.Execution.Result))))
+		}
 		return nil
 	default:
 		return fmt.Errorf("unknown output format %q", format)

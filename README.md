@@ -44,6 +44,12 @@ Generate a Query Draft from natural language without executing it:
 kusto-cli --service-uri https://help.kusto.windows.net --database Samples ask 'show recent storm events'
 ```
 
+Execute a Query Draft only after it passes static validation by using the explicit Execution Gate. Execution uses read-only Kusto request properties and caps returned records (default 100, configurable with `--max-rows`):
+
+```bash
+kusto-cli --service-uri https://help.kusto.windows.net --database Samples ask --execute --max-rows 25 'show recent storm events'
+```
+
 Or select the same Target from a Target Catalog alias:
 
 ```bash
@@ -94,6 +100,7 @@ kusto-cli auth status
 | Command | Description |
 |---------|-------------|
 | `kusto-cli ask '<natural-language prompt>'` | Generate a Query Draft without executing it |
+| `kusto-cli ask --execute [--max-rows N] '<natural-language prompt>'` | Execute only after the Query Draft passes static safety validation |
 | `kusto-cli query '<kql>'` | Run a KQL query |
 | `kusto-cli command '.show tables'` | Run a management command |
 | `kusto-cli databases list` | List databases |

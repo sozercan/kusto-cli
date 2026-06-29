@@ -22,7 +22,7 @@ Use `--dry-run` to preview write-capable direct calls without executing them.
 
 ## Query Draft safety validation v1
 
-`ask` is generate-first and does not execute generated KQL. The model provider's `model_safety` field is advisory only; the CLI-owned Query Draft validator is authoritative and records its result in `validation`.
+`ask` is generate-first and does not execute generated KQL unless the user supplies the explicit Execution Gate with `ask --execute`. The model provider's `model_safety` field is advisory only; the CLI-owned Query Draft validator is authoritative and records its result in `validation`.
 
 The v1 static validator is conservative and intentionally not a full KQL parser. A Query Draft is considered execution-eligible only when validation status is `passed` and `safe_for_execution` is `true`:
 
@@ -32,6 +32,8 @@ The v1 static validator is conservative and intentionally not a full KQL parser.
 - Multi-statement output may contain only `let` declarations or `declare query_parameters` statements before one final query expression. Multiple executable query statements and generated `set` request-option statements are blocked.
 - Exploratory row-returning drafts must include an explicit result bound (`take`, `limit`, `top`, or `sample`) or a reducing aggregation such as `count`, `summarize`, or `make-series`. Unbounded drafts produce validation warnings and are not execution-eligible until corrected.
 - If schema/prompt ambiguity blocks a safe table or function choice, a Query Draft may set `clarification_required` with a concise `clarification_question` instead of hallucinating a table choice. Non-blocking ambiguity should appear as explicit `assumptions`.
+
+When `ask --execute` is used, execution is attempted only after static validation passes. The execution request uses Kusto read-only request properties (`request_readonly` and `request_readonly_hardline`) plus a returned-record cap (`query_take_max_records`). The default cap is 100 rows and can be changed with `ask --execute --max-rows <N>` or `--execute-max-rows <N>`. Execution results or execution errors are reported under `execution` in the Query Draft response; query results are not sent back to the model provider by default, and `data_disclosure_policy.sent_to_model_provider.query_results` remains `false`.
 
 ## Agent guidance
 
