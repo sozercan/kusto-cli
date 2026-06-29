@@ -53,3 +53,21 @@ kusto-cli --known-services '[{"alias":"samples","service_uri":"https://help.kust
 ```
 
 If multiple targets are configured and none is selected, `ask` fails instead of choosing from prompt text.
+
+## Model provider mode for ask
+
+By default, `ask` stays offline and deterministic by using the fake model provider. For a real model path, use an OpenAI-compatible chat completions endpoint and keep the API key in an environment variable:
+
+```bash
+export OPENAI_API_KEY="..."
+kusto-cli \
+  --service-uri https://help.kusto.windows.net \
+  --database Samples \
+  --model-provider openai-compatible \
+  --model-endpoint https://api.openai.com/v1/chat/completions \
+  --model test-model \
+  --model-api-key-env OPENAI_API_KEY \
+  ask 'show recent storm events'
+```
+
+Provider output is structured JSON that becomes a Query Draft. Treat any model safety classification as advisory only: validation and execution gating remain independent CLI responsibilities.

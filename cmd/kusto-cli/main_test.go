@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -434,6 +436,203 @@ func TestFakeQueryDraftAgentEscapesPrompt(t *testing.T) {
 	}
 	if draft.Query != "search 'can''t find storms'\n| take 10" {
 		t.Fatalf("query = %q", draft.Query)
+	}
+}
+
+func TestAskDefaultsToFakeModelProvider(t *testing.T) {
+	var out bytes.Buffer
+	s := &server{
+		cfg:              config{serviceURI: "https://help.kusto.windows.net", database: "Samples", output: "json"},
+		schemaDiscoverer: &fakeSchemaDiscoverer{ctx: fakeStormSchemaContext()},
+		stdout:           &out,
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.runCommand(context.Background(), []string{"ask", "show", "storm", "events"}); err != nil {
+		t.Fatal(err)
+	}
+	var draft queryDraft
+	if err := json.Unmarshal(out.Bytes(), &draft); err != nil {
+		t.Fatal(err)
+	}
+	if draft.Query != "search 'show storm events'\n| take 10" {
+		t.Fatalf("query = %q; want deterministic fake-provider query", draft.Query)
+	}
+	if len(draft.Assumptions) != 2 || !strings.Contains(draft.Assumptions[1], "No real model provider") {
+		t.Fatalf("assumptions = %#v; want fake provider disclosure", draft.Assumptions)
+	}
+}
+
+func TestAskOpenAICompatibleModelProviderProducesQueryDraft(t *testing.T) {
+	const secret = "sk-test-model-secret"
+	t.Setenv("KUSTO_TEST_MODEL_KEY", secret)
+
+	sawRequest := false
+	modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawRequest = true
+		if r.Method != http.MethodPost {
+			t.Error("model provider should use POST")
+		}
+		if r.Header.Get("Authorization") != "Bearer "+secret {
+			t.Error("unexpected Authorization header")
+		}
+		var got openAIChatCompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Error("failed to decode model provider request")
+			return
+		}
+		if got.Model != "test-model" {
+			t.Errorf("model = %q; want test-model", got.Model)
+		}
+		if got.ResponseFormat.Type != "json_schema" || got.ResponseFormat.JSONSchema.Name != "kusto_query_draft" {
+			t.Errorf("response_format = %#v; want query draft JSON schema", got.ResponseFormat)
+		}
+		requestText, err := json.Marshal(got)
+		if err != nil {
+			t.Error("failed to inspect model provider request")
+			return
+		}
+		if strings.Contains(string(requestText), secret) {
+			t.Error("model provider request body leaked API key")
+		}
+		if !strings.Contains(got.Messages[len(got.Messages)-1].Content, "StormEvents") {
+			t.Error("model provider request did not include Schema Context")
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		content := `{"query":"StormEvents | take 5","assumptions":["Using the public sample StormEvents table."],"warnings":["Review before execution."],"model_safety":{"classification":"safe","reason":"Read-only query draft."}}`
+		if err := json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{"message": map[string]any{"content": content}}},
+		}); err != nil {
+			t.Error("failed to write model provider response")
+		}
+	}))
+	defer modelServer.Close()
+
+	var out bytes.Buffer
+	s := &server{
+		cfg: config{
+			serviceURI:     "https://help.kusto.windows.net",
+			database:       "Samples",
+			output:         "json",
+			modelProvider:  "openai-compatible",
+			modelEndpoint:  modelServer.URL,
+			modelName:      "test-model",
+			modelAPIKeyEnv: "KUSTO_TEST_MODEL_KEY",
+		},
+		hc:               modelServer.Client(),
+		schemaDiscoverer: &fakeSchemaDiscoverer{ctx: fakeStormSchemaContext()},
+		stdout:           &out,
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.runCommand(context.Background(), []string{"ask", "show", "storm", "events"}); err != nil {
+		t.Fatal(err)
+	}
+	if !sawRequest {
+		t.Fatal("model provider was not called")
+	}
+	if strings.Contains(out.String(), secret) {
+		t.Fatal("ask output leaked API key")
+	}
+	var draft queryDraft
+	if err := json.Unmarshal(out.Bytes(), &draft); err != nil {
+		t.Fatal(err)
+	}
+	if draft.Query != "StormEvents | take 5" {
+		t.Fatalf("query = %q; want model provider query", draft.Query)
+	}
+	if draft.ModelSafety == nil || draft.ModelSafety.Classification != "safe" || !draft.ModelSafety.Advisory {
+		t.Fatalf("model safety = %#v; want advisory safe classification", draft.ModelSafety)
+	}
+	if draft.Validation.Status != "passed" || !draft.Validation.ReadOnly {
+		t.Fatalf("validation = %#v; want independent read-only validation to pass", draft.Validation)
+	}
+}
+
+func TestOpenAICompatibleModelProviderConfigErrorsDoNotLeakSecrets(t *testing.T) {
+	const secret = "sk-test-config-secret"
+	t.Setenv("KUSTO_TEST_MODEL_KEY", secret)
+	t.Setenv("KUSTO_TEST_MISSING_MODEL_KEY", "")
+
+	_, err := newConfiguredModelProvider(config{modelProvider: "openai-compatible", modelAPIKeyEnv: "KUSTO_TEST_MODEL_KEY"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "model is required") {
+		t.Fatal("expected missing model configuration error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatal("missing model error leaked API key")
+	}
+
+	_, err = newConfiguredModelProvider(config{modelProvider: "openai-compatible", modelName: "test-model", modelAPIKeyEnv: "KUSTO_TEST_MISSING_MODEL_KEY"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "KUSTO_TEST_MISSING_MODEL_KEY") {
+		t.Fatal("expected missing API key environment variable error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatal("missing API key error leaked another API key")
+	}
+}
+
+func TestOpenAICompatibleModelProviderMalformedStructuredOutput(t *testing.T) {
+	const secret = "sk-test-malformed-secret"
+	t.Setenv("KUSTO_TEST_MODEL_KEY", secret)
+	modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		content := `{"assumptions":[],"warnings":[]}`
+		if err := json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{"message": map[string]any{"content": content}}},
+		}); err != nil {
+			t.Error("failed to write model provider response")
+		}
+	}))
+	defer modelServer.Close()
+
+	provider, err := newOpenAICompatibleModelProvider(config{
+		modelProvider:  "openai-compatible",
+		modelEndpoint:  modelServer.URL,
+		modelName:      "test-model",
+		modelAPIKeyEnv: "KUSTO_TEST_MODEL_KEY",
+	}, modelServer.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = provider.GenerateQueryDraft(context.Background(), queryDraftRequest{Prompt: "show storm events"})
+	if err == nil || !strings.Contains(err.Error(), "malformed structured output") {
+		t.Fatal("expected malformed structured output error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatal("malformed output error leaked API key")
+	}
+}
+
+func TestOpenAICompatibleModelProviderHTTPErrorRedactsAPIKey(t *testing.T) {
+	const secret = "sk-test-http-secret"
+	t.Setenv("KUSTO_TEST_MODEL_KEY", secret)
+	modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"bad token sk-test-http-secret"}}`))
+	}))
+	defer modelServer.Close()
+
+	provider, err := newOpenAICompatibleModelProvider(config{
+		modelProvider:  "openai-compatible",
+		modelEndpoint:  modelServer.URL,
+		modelName:      "test-model",
+		modelAPIKeyEnv: "KUSTO_TEST_MODEL_KEY",
+	}, modelServer.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = provider.GenerateQueryDraft(context.Background(), queryDraftRequest{Prompt: "show storm events"})
+	if err == nil {
+		t.Fatal("expected HTTP error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatal("HTTP error leaked API key")
+	}
+	if !strings.Contains(err.Error(), "[REDACTED]") {
+		t.Fatal("HTTP error did not redact API key")
 	}
 }
 
