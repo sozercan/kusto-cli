@@ -38,6 +38,8 @@ const (
 
 	defaultSchemaContextSampleRows = 3
 	defaultAskExecutionMaxRecords  = 100
+	defaultAskRepairMaxAttempts    = 1
+	maxAskRepairMaxAttempts        = 5
 	maxSchemaContextTables         = 5
 	maxSchemaContextFunctions      = 3
 	maxSchemaContextColumns        = 24
@@ -164,7 +166,30 @@ type queryDraft struct {
 	DataDisclosure        queryDraftDataDisclosure  `json:"data_disclosure_policy"`
 	Validation            queryDraftValidation      `json:"validation"`
 	Execution             queryDraftExecution       `json:"execution"`
+	RepairHistory         []queryDraftRepairPass    `json:"repair_history,omitempty"`
 	ModelSafety           *queryDraftModelSafety    `json:"model_safety,omitempty"`
+}
+
+type queryDraftRepairPass struct {
+	Attempt         int    `json:"attempt"`
+	Trigger         string `json:"trigger"`
+	InputQuery      string `json:"input_query"`
+	ValidationError string `json:"validation_error"`
+	OutputQuery     string `json:"output_query,omitempty"`
+	Status          string `json:"status"`
+	Error           string `json:"error,omitempty"`
+}
+
+type queryDraftRepairRequest struct {
+	Target            queryDraftTarget          `json:"target"`
+	Prompt            string                    `json:"prompt"`
+	SchemaContext     []queryDraftSchemaContext `json:"schema_context"`
+	DataDisclosure    queryDraftDataDisclosure  `json:"data_disclosure_policy"`
+	PreviousQuery     string                    `json:"previous_query"`
+	ValidationError   string                    `json:"validation_error"`
+	ValidationErrors  []string                  `json:"validation_errors"`
+	RepairAttempt     int                       `json:"repair_attempt"`
+	MaxRepairAttempts int                       `json:"max_repair_attempts"`
 }
 
 type queryDraftModelSafety struct {
@@ -221,9 +246,17 @@ type queryDraftValidation struct {
 	ReadOnly         bool                        `json:"read_only"`
 	Bounded          bool                        `json:"bounded"`
 	SafeForExecution bool                        `json:"safe_for_execution"`
+	QueryPlan        *queryDraftPlanValidation   `json:"query_plan,omitempty"`
 	Checks           []queryDraftValidationCheck `json:"checks"`
 	Warnings         []string                    `json:"warnings"`
 	Errors           []string                    `json:"errors"`
+}
+
+type queryDraftPlanValidation struct {
+	Requested bool   `json:"requested"`
+	Status    string `json:"status"`
+	Error     string `json:"error,omitempty"`
+	Message   string `json:"message,omitempty"`
 }
 
 type queryDraftValidationCheck struct {
@@ -246,6 +279,10 @@ type kustoExecuteFunc func(ctx context.Context, clusterURI, database, csl, kind 
 
 type queryDraftAgent interface {
 	GenerateQueryDraft(context.Context, queryDraftRequest) (queryDraft, error)
+}
+
+type queryDraftRepairer interface {
+	RepairQueryDraft(context.Context, queryDraftRepairRequest) (queryDraft, error)
 }
 
 type fakeQueryDraftAgent struct{}
@@ -430,7 +467,13 @@ type askTargetSelection struct {
 	DatabaseSet       bool
 	IncludeSampleRows bool
 	Execute           bool
+	ValidatePlan      bool
+	ValidatePlanSet   bool
+	Repair            bool
+	RepairSet         bool
 	MaxRecords        int
+	MaxRepairAttempts int
+	MaxRepairSet      bool
 }
 
 type askTargetCandidate struct {
@@ -442,6 +485,10 @@ type askTargetCandidate struct {
 
 func (s *server) runAskCommand(ctx context.Context, args []string) error {
 	selection, prompt, err := parseAskArgs(args)
+	if err != nil {
+		return err
+	}
+	selection, err = applyConfiguredAskDefaults(selection)
 	if err != nil {
 		return err
 	}
@@ -464,6 +511,7 @@ func (s *server) runAskCommand(ctx context.Context, args []string) error {
 	if schemaErr != nil {
 		draft.Warnings = append(draft.Warnings, "Schema Context discovery failed; Query Draft may be less accurate: "+schemaErr.Error())
 	}
+	s.applyQueryPlanValidationAndRepair(ctx, &draft, req, agent, selection)
 	s.applyExecutionGate(ctx, &draft, selection)
 	return writeQueryDraft(s.output(), s.cfg.output, draft)
 }
@@ -534,6 +582,49 @@ func parseAskArgs(args []string) (askTargetSelection, string, error) {
 			}
 			selection.Execute = value
 			i++
+		case arg == "--validate-plan":
+			selection.ValidatePlan = true
+			selection.ValidatePlanSet = true
+			i++
+		case strings.HasPrefix(arg, "--validate-plan="):
+			value, err := strconv.ParseBool(strings.TrimPrefix(arg, "--validate-plan="))
+			if err != nil {
+				return selection, "", fmt.Errorf("--validate-plan requires a boolean value: %w", err)
+			}
+			selection.ValidatePlan = value
+			selection.ValidatePlanSet = true
+			i++
+		case arg == "--repair":
+			selection.Repair = true
+			selection.RepairSet = true
+			i++
+		case strings.HasPrefix(arg, "--repair="):
+			value, err := strconv.ParseBool(strings.TrimPrefix(arg, "--repair="))
+			if err != nil {
+				return selection, "", fmt.Errorf("--repair requires a boolean value: %w", err)
+			}
+			selection.Repair = value
+			selection.RepairSet = true
+			i++
+		case arg == "--max-repair-attempts":
+			if i+1 >= len(args) {
+				return selection, "", errors.New("--max-repair-attempts requires a value")
+			}
+			maxAttempts, err := parseAskRepairMaxAttempts(args[i+1], arg)
+			if err != nil {
+				return selection, "", err
+			}
+			selection.MaxRepairAttempts = maxAttempts
+			selection.MaxRepairSet = true
+			i += 2
+		case strings.HasPrefix(arg, "--max-repair-attempts="):
+			maxAttempts, err := parseAskRepairMaxAttempts(strings.TrimPrefix(arg, "--max-repair-attempts="), "--max-repair-attempts")
+			if err != nil {
+				return selection, "", err
+			}
+			selection.MaxRepairAttempts = maxAttempts
+			selection.MaxRepairSet = true
+			i++
 		case arg == "--max-rows" || arg == "--execute-max-rows":
 			if i+1 >= len(args) {
 				return selection, "", fmt.Errorf("%s requires a value", arg)
@@ -596,6 +687,63 @@ func parseAskExecutionMaxRecords(value, flagName string) (int, error) {
 		return 0, fmt.Errorf("%s requires a value greater than zero", flagName)
 	}
 	return maxRecords, nil
+}
+
+func parseAskRepairMaxAttempts(value, flagName string) (int, error) {
+	maxAttempts, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return 0, fmt.Errorf("%s requires an integer value: %w", flagName, err)
+	}
+	if maxAttempts <= 0 {
+		return 0, fmt.Errorf("%s requires a value greater than zero", flagName)
+	}
+	if maxAttempts > maxAskRepairMaxAttempts {
+		return 0, fmt.Errorf("%s must be %d or less", flagName, maxAskRepairMaxAttempts)
+	}
+	return maxAttempts, nil
+}
+
+func applyConfiguredAskDefaults(selection askTargetSelection) (askTargetSelection, error) {
+	if !selection.ValidatePlanSet {
+		value, ok, err := configuredBool("KUSTO_ASK_VALIDATE_PLAN")
+		if err != nil {
+			return selection, err
+		}
+		if ok {
+			selection.ValidatePlan = value
+		}
+	}
+	if !selection.RepairSet {
+		value, ok, err := configuredBool("KUSTO_ASK_REPAIR")
+		if err != nil {
+			return selection, err
+		}
+		if ok {
+			selection.Repair = value
+		}
+	}
+	if !selection.MaxRepairSet {
+		value := os.Getenv("KUSTO_ASK_MAX_REPAIR_ATTEMPTS")
+		if strings.TrimSpace(value) != "" {
+			maxAttempts, err := parseAskRepairMaxAttempts(value, "ask max repair attempts")
+			if err != nil {
+				return selection, err
+			}
+			selection.MaxRepairAttempts = maxAttempts
+		}
+	}
+	return selection, nil
+}
+
+func configuredBool(envName string) (bool, bool, error) {
+	if value := strings.TrimSpace(os.Getenv(envName)); value != "" {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return false, false, fmt.Errorf("%s requires a boolean value: %w", envName, err)
+		}
+		return parsed, true, nil
+	}
+	return false, false, nil
 }
 
 func (s *server) queryDraftTarget(selection askTargetSelection) (queryDraftTarget, error) {
@@ -827,6 +975,144 @@ func (s *server) applyExecutionGate(ctx context.Context, draft *queryDraft, sele
 	draft.Execution.Status = "succeeded"
 	draft.Execution.Reason = "executed after explicit Execution Gate"
 	draft.Execution.Result = &resp
+}
+
+func (s *server) applyQueryPlanValidationAndRepair(ctx context.Context, draft *queryDraft, req queryDraftRequest, agent queryDraftAgent, selection askTargetSelection) {
+	if draft == nil {
+		return
+	}
+	validatePlan := selection.ValidatePlan || selection.Repair
+	maxAttempts := askRepairMaxAttempts(selection)
+	attempts := 0
+	for {
+		trigger := ""
+		validationError := ""
+		validationErrors := []string{}
+
+		if !draft.Validation.SafeForExecution {
+			validationErrors = queryDraftValidationMessages(draft.Validation)
+			validationError = strings.Join(validationErrors, "; ")
+			if validationError == "" {
+				validationError = "Query Draft safety validation did not pass"
+			}
+			trigger = "static_validation"
+			if validatePlan && draft.Validation.QueryPlan == nil {
+				draft.Validation.QueryPlan = &queryDraftPlanValidation{Requested: true, Status: "skipped", Message: "static Query Draft safety validation must pass before Kusto-side query-plan validation"}
+			}
+		} else if validatePlan {
+			s.applyQueryPlanValidation(ctx, draft)
+			if draft.Validation.QueryPlan == nil || draft.Validation.QueryPlan.Status == "passed" {
+				return
+			}
+			if draft.Validation.QueryPlan.Status != "failed" {
+				return
+			}
+			validationErrors = queryDraftValidationMessages(draft.Validation)
+			validationError = strings.Join(validationErrors, "; ")
+			if validationError == "" {
+				validationError = draft.Validation.QueryPlan.Error
+			}
+			trigger = "query_plan_validation"
+		} else {
+			return
+		}
+
+		if !selection.Repair {
+			return
+		}
+		if attempts >= maxAttempts {
+			draft.Warnings = append(draft.Warnings, fmt.Sprintf("Repair Pass maximum reached (%d); returning last Query Draft without execution.", maxAttempts))
+			draft.Execution = queryDraftExecution{Executed: false, Reason: queryDraftExecutionReason(draft.Validation)}
+			return
+		}
+		repairer, ok := agent.(queryDraftRepairer)
+		if !ok {
+			draft.Warnings = append(draft.Warnings, "Repair Pass requested, but the configured Query Draft Agent does not support Repair Passes.")
+			draft.Execution = queryDraftExecution{Executed: false, Reason: queryDraftExecutionReason(draft.Validation)}
+			return
+		}
+
+		attempts++
+		repairReq := queryDraftRepairRequest{
+			Target:            req.Target,
+			Prompt:            req.Prompt,
+			SchemaContext:     req.SchemaContext,
+			DataDisclosure:    req.DataDisclosure,
+			PreviousQuery:     strings.TrimSpace(draft.Query),
+			ValidationError:   validationError,
+			ValidationErrors:  validationErrors,
+			RepairAttempt:     attempts,
+			MaxRepairAttempts: maxAttempts,
+		}
+		repairReq.DataDisclosure.Sent.QueryResults = false
+		history := queryDraftRepairPass{
+			Attempt:         attempts,
+			Trigger:         trigger,
+			InputQuery:      strings.TrimSpace(draft.Query),
+			ValidationError: validationError,
+			Status:          "requested",
+		}
+		repaired, err := repairer.RepairQueryDraft(ctx, repairReq)
+		if err != nil {
+			history.Status = "failed"
+			history.Error = err.Error()
+			draft.RepairHistory = append(draft.RepairHistory, history)
+			draft.Warnings = append(draft.Warnings, "Repair Pass failed: "+err.Error())
+			draft.Execution = queryDraftExecution{Executed: false, Reason: queryDraftExecutionReason(draft.Validation)}
+			return
+		}
+		history.OutputQuery = strings.TrimSpace(repaired.Query)
+		history.Status = "generated"
+		historySoFar := append([]queryDraftRepairPass{}, draft.RepairHistory...)
+		historySoFar = append(historySoFar, history)
+		normalizeQueryDraft(&repaired, req)
+		repaired.RepairHistory = historySoFar
+		*draft = repaired
+	}
+}
+
+func (s *server) applyQueryPlanValidation(ctx context.Context, draft *queryDraft) {
+	if draft == nil {
+		return
+	}
+	if !draft.Validation.SafeForExecution {
+		draft.Validation.QueryPlan = &queryDraftPlanValidation{Requested: true, Status: "skipped", Message: "static Query Draft safety validation must pass before Kusto-side query-plan validation"}
+		return
+	}
+	plan := queryDraftPlanValidation{Requested: true}
+	_, err := s.executeKusto(ctx, draft.Target.ClusterURI, draft.Target.Database, ".show queryplan <| "+strings.TrimSpace(draft.Query), "mgmt", true, nil)
+	if err != nil {
+		plan.Status = "failed"
+		plan.Error = err.Error()
+		message := "query-plan validation failed: " + err.Error()
+		draft.Validation.QueryPlan = &plan
+		draft.Validation.Status = "failed"
+		draft.Validation.SafeForExecution = false
+		draft.Validation.Checks = append(draft.Validation.Checks, queryDraftValidationCheck{Name: "query_plan_validation", Passed: false, Severity: "error", Message: message})
+		draft.Validation.Errors = append(draft.Validation.Errors, message)
+		draft.Execution = queryDraftExecution{Executed: false, Reason: queryDraftExecutionReason(draft.Validation)}
+		return
+	}
+	plan.Status = "passed"
+	plan.Message = "Kusto-side query-plan validation passed"
+	draft.Validation.QueryPlan = &plan
+	draft.Validation.Checks = append(draft.Validation.Checks, queryDraftValidationCheck{Name: "query_plan_validation", Passed: true})
+}
+
+func queryDraftValidationMessages(validation queryDraftValidation) []string {
+	messages := append([]string{}, validation.Errors...)
+	messages = append(messages, validation.Warnings...)
+	if len(messages) == 0 && validation.QueryPlan != nil && validation.QueryPlan.Status == "failed" && validation.QueryPlan.Error != "" {
+		messages = append(messages, validation.QueryPlan.Error)
+	}
+	return messages
+}
+
+func askRepairMaxAttempts(selection askTargetSelection) int {
+	if selection.MaxRepairAttempts > 0 {
+		return selection.MaxRepairAttempts
+	}
+	return defaultAskRepairMaxAttempts
 }
 
 func askExecutionMaxRecords(selection askTargetSelection) int {
@@ -1949,8 +2235,8 @@ func (s *server) runAPICommand(ctx context.Context, args []string) error {
 
 func printKustoUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
-  kusto-cli --service-uri <cluster> --database <db> ask [--include-samples] [--execute] [--max-rows N] '<natural-language prompt>'
-  kusto-cli --target <alias> ask [--include-samples] [--execute] [--max-rows N] '<natural-language prompt>'
+  kusto-cli --service-uri <cluster> --database <db> ask [--include-samples] [--validate-plan] [--repair] [--max-repair-attempts N] [--execute] [--max-rows N] '<natural-language prompt>'
+  kusto-cli --target <alias> ask [--include-samples] [--validate-plan] [--repair] [--max-repair-attempts N] [--execute] [--max-rows N] '<natural-language prompt>'
   kusto-cli --service-uri <cluster> --database <db> query '<kql>'
   kusto-cli databases list
   kusto-cli tables list
@@ -2049,6 +2335,31 @@ func writeQueryDraft(w io.Writer, format string, draft queryDraft) error {
 			}
 			fmt.Fprintf(w, "- %s: %s (%s)\n", check.Name, status, check.Message)
 		}
+		if draft.Validation.QueryPlan != nil {
+			fmt.Fprintf(w, "Query Plan Validation: %s", draft.Validation.QueryPlan.Status)
+			if draft.Validation.QueryPlan.Error != "" {
+				fmt.Fprintf(w, " (%s)", draft.Validation.QueryPlan.Error)
+			} else if draft.Validation.QueryPlan.Message != "" {
+				fmt.Fprintf(w, " (%s)", draft.Validation.QueryPlan.Message)
+			}
+			fmt.Fprintln(w)
+		}
+		if len(draft.RepairHistory) > 0 {
+			fmt.Fprintln(w, "Repair History:")
+			for _, pass := range draft.RepairHistory {
+				fmt.Fprintf(w, "- attempt %d: %s", pass.Attempt, pass.Status)
+				if pass.Trigger != "" {
+					fmt.Fprintf(w, " (%s)", pass.Trigger)
+				}
+				if pass.OutputQuery != "" {
+					fmt.Fprintf(w, " -> %s", oneLine(pass.OutputQuery))
+				}
+				if pass.Error != "" {
+					fmt.Fprintf(w, " error=%s", oneLine(pass.Error))
+				}
+				fmt.Fprintln(w)
+			}
+		}
 		if draft.Execution.Executed {
 			fmt.Fprintf(w, "Execution: executed (%s)\n", draft.Execution.Reason)
 		} else {
@@ -2097,6 +2408,18 @@ func writeQueryDraft(w io.Writer, format string, draft queryDraft) error {
 		fmt.Fprintf(w, "validation.safe_for_execution\t%t\n", draft.Validation.SafeForExecution)
 		fmt.Fprintf(w, "validation.warnings\t%s\n", oneLine(strings.Join(draft.Validation.Warnings, "; ")))
 		fmt.Fprintf(w, "validation.errors\t%s\n", oneLine(strings.Join(draft.Validation.Errors, "; ")))
+		if draft.Validation.QueryPlan != nil {
+			fmt.Fprintf(w, "validation.query_plan.status\t%s\n", oneLine(draft.Validation.QueryPlan.Status))
+			if draft.Validation.QueryPlan.Error != "" {
+				fmt.Fprintf(w, "validation.query_plan.error\t%s\n", oneLine(draft.Validation.QueryPlan.Error))
+			}
+			if draft.Validation.QueryPlan.Message != "" {
+				fmt.Fprintf(w, "validation.query_plan.message\t%s\n", oneLine(draft.Validation.QueryPlan.Message))
+			}
+		}
+		if len(draft.RepairHistory) > 0 {
+			fmt.Fprintf(w, "repair_history\t%s\n", oneLine(string(mustJSON(draft.RepairHistory))))
+		}
 		fmt.Fprintf(w, "execution.executed\t%t\n", draft.Execution.Executed)
 		fmt.Fprintf(w, "execution.reason\t%s\n", oneLine(draft.Execution.Reason))
 		if draft.Execution.Status != "" {

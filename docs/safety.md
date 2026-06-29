@@ -35,6 +35,12 @@ The v1 static validator is conservative and intentionally not a full KQL parser.
 
 When `ask --execute` is used, execution is attempted only after static validation passes. The execution request uses Kusto read-only request properties (`request_readonly` and `request_readonly_hardline`) plus a returned-record cap (`query_take_max_records`). The default cap is 100 rows and can be changed with `ask --execute --max-rows <N>` or `--execute-max-rows <N>`. Execution results or execution errors are reported under `execution` in the Query Draft response; query results are not sent back to the model provider by default, and `data_disclosure_policy.sent_to_model_provider.query_results` remains `false`.
 
+## Query-plan validation and Repair Passes
+
+`ask --validate-plan` requests Kusto-side query-plan validation with `.show queryplan <| <draft query>` after static safety validation passes and before any `--execute` query execution. The same behavior can be enabled for scripted use with `KUSTO_ASK_VALIDATE_PLAN=true`. If query-plan validation fails, the Query Draft is returned with `validation.query_plan.status="failed"`, the validation error is recorded, and execution is blocked.
+
+`ask --repair` enables bounded Repair Passes, and `KUSTO_ASK_REPAIR=true` can enable the same behavior for scripted use. A Repair Pass sends only the original prompt, Target, Schema Context, Data Disclosure Policy, previous query, and validation error to the Query Draft Agent/provider seam. It does not send execution results back to the model provider and it does not run exploratory queries or sample-data probes; the only Kusto-side validation route used by this feature is the explicit query-plan validation path. `--repair` implies query-plan validation. The default maximum is one Repair Pass; use `--max-repair-attempts <N>` (maximum 5) or `KUSTO_ASK_MAX_REPAIR_ATTEMPTS` to set a strict bound. If repair fails or the maximum is exhausted, `ask` returns the last Query Draft, the last validation error, and `repair_history` without executing.
+
 ## Agent guidance
 
 - Prefer `kusto_query` for KQL queries.

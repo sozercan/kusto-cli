@@ -45,6 +45,41 @@ func (a *scriptedQueryDraftAgent) GenerateQueryDraft(_ context.Context, req quer
 	return draft, nil
 }
 
+type repairingQueryDraftAgent struct {
+	generateDraft queryDraft
+	repairDrafts  []queryDraft
+	generateCalls int
+	repairCalls   []queryDraftRepairRequest
+}
+
+func (a *repairingQueryDraftAgent) GenerateQueryDraft(_ context.Context, req queryDraftRequest) (queryDraft, error) {
+	a.generateCalls++
+	draft := a.generateDraft
+	if draft.SchemaContext == nil {
+		draft.SchemaContext = req.SchemaContext
+	}
+	if draft.DataDisclosure.Mode == "" {
+		draft.DataDisclosure = req.DataDisclosure
+	}
+	return draft, nil
+}
+
+func (a *repairingQueryDraftAgent) RepairQueryDraft(_ context.Context, req queryDraftRepairRequest) (queryDraft, error) {
+	a.repairCalls = append(a.repairCalls, req)
+	idx := len(a.repairCalls) - 1
+	if idx >= len(a.repairDrafts) {
+		return queryDraft{}, errors.New("unexpected Repair Pass")
+	}
+	draft := a.repairDrafts[idx]
+	if draft.SchemaContext == nil {
+		draft.SchemaContext = req.SchemaContext
+	}
+	if draft.DataDisclosure.Mode == "" {
+		draft.DataDisclosure = req.DataDisclosure
+	}
+	return draft, nil
+}
+
 type fakeSchemaDiscoverer struct {
 	called bool
 	req    schemaDiscoveryRequest
@@ -535,6 +570,323 @@ func TestAskExecuteAppliesReadonlyAndRecordLimitsAndIncludesResult(t *testing.T)
 				t.Fatal("Query Draft reported query results sent to the model provider")
 			}
 		})
+	}
+}
+
+func TestAskExecuteValidatePlanRunsBeforeExecution(t *testing.T) {
+	var out bytes.Buffer
+	agent := &recordingQueryDraftAgent{}
+	calls := []string{}
+	s := &server{
+		cfg:              config{serviceURI: "https://help.kusto.windows.net", database: "Samples", output: "json"},
+		queryDraftAgent:  agent,
+		schemaDiscoverer: &fakeSchemaDiscoverer{ctx: fakeStormSchemaContext()},
+		executeHook: func(_ context.Context, clusterURI, database, csl, kind string, readonly bool, crp map[string]any) (kustoResponse, error) {
+			calls = append(calls, kind+":"+csl)
+			if clusterURI != "https://help.kusto.windows.net" || database != "Samples" || !readonly {
+				return kustoResponse{}, errors.New("unexpected Kusto validation/execution target")
+			}
+			switch kind {
+			case "mgmt":
+				if csl != ".show queryplan <| StormEvents | take 5" {
+					return kustoResponse{}, errors.New("unexpected query-plan validation command: " + csl)
+				}
+				return makeKustoResponse([]kustoColumn{{ColumnName: "Plan", ColumnType: "string"}}, [][]any{{"validated"}}), nil
+			case "query":
+				if csl != "StormEvents | take 5" {
+					return kustoResponse{}, errors.New("unexpected execution query: " + csl)
+				}
+				return makeKustoResponse([]kustoColumn{{ColumnName: "EventType", ColumnType: "string"}}, [][]any{{"Hail"}}), nil
+			default:
+				return kustoResponse{}, errors.New("unexpected Kusto call kind: " + kind)
+			}
+		},
+		stdout: &out,
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.runCommand(context.Background(), []string{"ask", "--execute", "--validate-plan", "show", "storm", "events"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 2 || !strings.HasPrefix(calls[0], "mgmt:.show queryplan <|") || !strings.HasPrefix(calls[1], "query:StormEvents") {
+		t.Fatalf("Kusto calls = %#v; want query-plan validation before execution", calls)
+	}
+	var draft queryDraft
+	if err := json.Unmarshal(out.Bytes(), &draft); err != nil {
+		t.Fatalf("unmarshal Query Draft: %v\n%s", err, out.String())
+	}
+	if draft.Validation.QueryPlan == nil || draft.Validation.QueryPlan.Status != "passed" {
+		t.Fatalf("query-plan validation = %#v; want passed", draft.Validation.QueryPlan)
+	}
+	if !draft.Execution.Executed || draft.Execution.Status != "succeeded" {
+		t.Fatalf("execution = %#v; want execution after plan validation", draft.Execution)
+	}
+	if draft.DataDisclosure.Sent.QueryResults || agent.req.DataDisclosure.Sent.QueryResults {
+		t.Fatal("query results were marked as sent to model provider")
+	}
+}
+
+func TestAskValidatePlanCanBeConfiguredWithEnvironment(t *testing.T) {
+	t.Setenv("KUSTO_ASK_VALIDATE_PLAN", "true")
+	var out bytes.Buffer
+	planCalls := 0
+	executionCalls := 0
+	s := &server{
+		cfg:              config{serviceURI: "https://help.kusto.windows.net", database: "Samples", output: "json"},
+		queryDraftAgent:  &recordingQueryDraftAgent{},
+		schemaDiscoverer: &fakeSchemaDiscoverer{ctx: fakeStormSchemaContext()},
+		executeHook: func(_ context.Context, _, _, csl, kind string, _ bool, _ map[string]any) (kustoResponse, error) {
+			switch kind {
+			case "mgmt":
+				planCalls++
+				if !strings.HasPrefix(csl, ".show queryplan <|") {
+					return kustoResponse{}, errors.New("unexpected validation command: " + csl)
+				}
+				return makeKustoResponse([]kustoColumn{{ColumnName: "Plan", ColumnType: "string"}}, [][]any{{"validated"}}), nil
+			case "query":
+				executionCalls++
+				return makeKustoResponse([]kustoColumn{{ColumnName: "EventType", ColumnType: "string"}}, [][]any{{"Hail"}}), nil
+			default:
+				return kustoResponse{}, errors.New("unexpected Kusto call kind: " + kind)
+			}
+		},
+		stdout: &out,
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.runCommand(context.Background(), []string{"ask", "--execute", "show", "storm", "events"}); err != nil {
+		t.Fatal(err)
+	}
+	if planCalls != 1 || executionCalls != 1 {
+		t.Fatalf("plan calls = %d execution calls = %d; want configured plan validation before execution", planCalls, executionCalls)
+	}
+}
+
+func TestAskExecuteValidatePlanFailureDoesNotExecuteWithoutRepair(t *testing.T) {
+	var out bytes.Buffer
+	s := &server{
+		cfg:              config{serviceURI: "https://help.kusto.windows.net", database: "Samples", output: "json"},
+		queryDraftAgent:  &scriptedQueryDraftAgent{draft: queryDraft{Query: "StormEvents | where Staet == 'WA' | take 5"}},
+		schemaDiscoverer: &fakeSchemaDiscoverer{ctx: fakeStormSchemaContext()},
+		executeHook: func(_ context.Context, _, _, csl, kind string, _ bool, _ map[string]any) (kustoResponse, error) {
+			if kind == "query" {
+				return kustoResponse{}, errors.New("execution should not run after query-plan validation failure")
+			}
+			if !strings.HasPrefix(csl, ".show queryplan <|") {
+				return kustoResponse{}, errors.New("unexpected validation command: " + csl)
+			}
+			return kustoResponse{}, errors.New("Semantic error: Failed to resolve scalar expression named 'Staet'")
+		},
+		stdout: &out,
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.runCommand(context.Background(), []string{"ask", "--execute", "--validate-plan", "show", "WA", "storms"}); err != nil {
+		t.Fatal(err)
+	}
+	var draft queryDraft
+	if err := json.Unmarshal(out.Bytes(), &draft); err != nil {
+		t.Fatalf("unmarshal Query Draft: %v\n%s", err, out.String())
+	}
+	if draft.Validation.QueryPlan == nil || draft.Validation.QueryPlan.Status != "failed" || !strings.Contains(draft.Validation.QueryPlan.Error, "Staet") {
+		t.Fatalf("query-plan validation = %#v; want failed Staet error", draft.Validation.QueryPlan)
+	}
+	if draft.Validation.SafeForExecution || draft.Validation.Status != "failed" || !containsString(draft.Validation.Errors, "query-plan validation failed") {
+		t.Fatalf("validation = %#v; want failed and not safe for execution", draft.Validation)
+	}
+	if draft.Execution.Executed || draft.Execution.Status != "blocked" || !strings.Contains(draft.Execution.Reason, "Execution Gate requested") {
+		t.Fatalf("execution = %#v; want blocked without executing", draft.Execution)
+	}
+	if len(draft.RepairHistory) != 0 {
+		t.Fatalf("repair history = %#v; want no Repair Pass without --repair", draft.RepairHistory)
+	}
+}
+
+func TestAskRepairUsesPlanValidationErrorAndExecutesRepairedDraft(t *testing.T) {
+	var out bytes.Buffer
+	agent := &repairingQueryDraftAgent{
+		generateDraft: queryDraft{Query: "StormEvents | where Staet == 'WA' | take 5"},
+		repairDrafts: []queryDraft{{
+			Query:       "StormEvents | where State == 'WA' | take 5",
+			Assumptions: []string{"Corrected column name using Schema Context."},
+		}},
+	}
+	planCalls := 0
+	executionCalls := 0
+	s := &server{
+		cfg:              config{serviceURI: "https://help.kusto.windows.net", database: "Samples", output: "json"},
+		queryDraftAgent:  agent,
+		schemaDiscoverer: &fakeSchemaDiscoverer{ctx: fakeStormSchemaContext()},
+		executeHook: func(_ context.Context, _, _, csl, kind string, _ bool, _ map[string]any) (kustoResponse, error) {
+			switch kind {
+			case "mgmt":
+				planCalls++
+				if !strings.HasPrefix(csl, ".show queryplan <|") {
+					return kustoResponse{}, errors.New("unexpected validation command: " + csl)
+				}
+				if strings.Contains(csl, "Staet") {
+					return kustoResponse{}, errors.New("Semantic error: Failed to resolve scalar expression named 'Staet'")
+				}
+				if !strings.Contains(csl, "State == 'WA'") {
+					return kustoResponse{}, errors.New("unexpected repaired query-plan command: " + csl)
+				}
+				return makeKustoResponse([]kustoColumn{{ColumnName: "Plan", ColumnType: "string"}}, [][]any{{"validated"}}), nil
+			case "query":
+				executionCalls++
+				if csl != "StormEvents | where State == 'WA' | take 5" {
+					return kustoResponse{}, errors.New("unexpected execution query: " + csl)
+				}
+				return makeKustoResponse([]kustoColumn{{ColumnName: "EventType", ColumnType: "string"}}, [][]any{{"Hail"}}), nil
+			default:
+				return kustoResponse{}, errors.New("unexpected Kusto call kind: " + kind)
+			}
+		},
+		stdout: &out,
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.runCommand(context.Background(), []string{"ask", "--execute", "--repair", "--max-repair-attempts", "2", "show", "WA", "storms"}); err != nil {
+		t.Fatal(err)
+	}
+	if agent.generateCalls != 1 || len(agent.repairCalls) != 1 {
+		t.Fatalf("generate calls = %d repair calls = %d; want one initial generation and one Repair Pass", agent.generateCalls, len(agent.repairCalls))
+	}
+	if planCalls != 2 || executionCalls != 1 {
+		t.Fatalf("plan calls = %d execution calls = %d; want failed plan, repaired plan, then execution", planCalls, executionCalls)
+	}
+	req := agent.repairCalls[0]
+	if req.PreviousQuery != "StormEvents | where Staet == 'WA' | take 5" || !strings.Contains(req.ValidationError, "Staet") {
+		t.Fatalf("repair request = %#v; want previous query and validation error", req)
+	}
+	if len(req.SchemaContext) != 1 || len(req.SchemaContext[0].Tables) != 1 || len(req.SchemaContext[0].Tables[0].SampleRows) != 0 {
+		t.Fatalf("repair Schema Context = %#v; want schema-only context without sample rows", req.SchemaContext)
+	}
+	var draft queryDraft
+	if err := json.Unmarshal(out.Bytes(), &draft); err != nil {
+		t.Fatalf("unmarshal Query Draft: %v\n%s", err, out.String())
+	}
+	if draft.Query != "StormEvents | where State == 'WA' | take 5" {
+		t.Fatalf("query = %q; want repaired draft", draft.Query)
+	}
+	if draft.Validation.QueryPlan == nil || draft.Validation.QueryPlan.Status != "passed" || !draft.Validation.SafeForExecution {
+		t.Fatalf("validation = %#v; want passed query-plan validation", draft.Validation)
+	}
+	if len(draft.RepairHistory) != 1 || draft.RepairHistory[0].Attempt != 1 || !strings.Contains(draft.RepairHistory[0].ValidationError, "Staet") || draft.RepairHistory[0].OutputQuery != draft.Query {
+		t.Fatalf("repair history = %#v; want first Repair Pass with validation error and repaired query", draft.RepairHistory)
+	}
+	if !draft.Execution.Executed || draft.Execution.Status != "succeeded" {
+		t.Fatalf("execution = %#v; want repaired query executed", draft.Execution)
+	}
+	if draft.DataDisclosure.Sent.QueryResults || req.DataDisclosure.Sent.QueryResults {
+		t.Fatal("query results were marked as sent to model provider")
+	}
+}
+
+func TestAskRepairFailureReturnsLastDraftAndValidationErrorWithoutExecution(t *testing.T) {
+	var out bytes.Buffer
+	agent := &repairingQueryDraftAgent{
+		generateDraft: queryDraft{Query: "StormEvents | where Staet == 'WA' | take 5"},
+		repairDrafts:  []queryDraft{{Query: "StormEvents | where Staet2 == 'WA' | take 5"}},
+	}
+	planCalls := 0
+	s := &server{
+		cfg:              config{serviceURI: "https://help.kusto.windows.net", database: "Samples", output: "json"},
+		queryDraftAgent:  agent,
+		schemaDiscoverer: &fakeSchemaDiscoverer{ctx: fakeStormSchemaContext()},
+		executeHook: func(_ context.Context, _, _, csl, kind string, _ bool, _ map[string]any) (kustoResponse, error) {
+			if kind == "query" {
+				return kustoResponse{}, errors.New("execution should not run when Repair Passes fail validation")
+			}
+			planCalls++
+			if strings.Contains(csl, "Staet2") {
+				return kustoResponse{}, errors.New("Semantic error: Failed to resolve scalar expression named 'Staet2'")
+			}
+			return kustoResponse{}, errors.New("Semantic error: Failed to resolve scalar expression named 'Staet'")
+		},
+		stdout: &out,
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.runCommand(context.Background(), []string{"ask", "--execute", "--repair", "show", "WA", "storms"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(agent.repairCalls) != defaultAskRepairMaxAttempts || planCalls != defaultAskRepairMaxAttempts+1 {
+		t.Fatalf("repair calls = %d plan calls = %d; want one Repair Pass and validation of last draft", len(agent.repairCalls), planCalls)
+	}
+	var draft queryDraft
+	if err := json.Unmarshal(out.Bytes(), &draft); err != nil {
+		t.Fatalf("unmarshal Query Draft: %v\n%s", err, out.String())
+	}
+	if draft.Query != "StormEvents | where Staet2 == 'WA' | take 5" {
+		t.Fatalf("query = %q; want last repaired draft", draft.Query)
+	}
+	if draft.Validation.QueryPlan == nil || draft.Validation.QueryPlan.Status != "failed" || !strings.Contains(draft.Validation.QueryPlan.Error, "Staet2") {
+		t.Fatalf("query-plan validation = %#v; want last validation error", draft.Validation.QueryPlan)
+	}
+	if draft.Execution.Executed || draft.Execution.Status != "blocked" {
+		t.Fatalf("execution = %#v; want blocked without execution", draft.Execution)
+	}
+	if len(draft.RepairHistory) != 1 || draft.RepairHistory[0].OutputQuery != draft.Query {
+		t.Fatalf("repair history = %#v; want failed Repair Pass output recorded", draft.RepairHistory)
+	}
+	if !containsString(draft.Warnings, "Repair Pass maximum reached") {
+		t.Fatalf("warnings = %#v; want maximum reached warning", draft.Warnings)
+	}
+}
+
+func TestAskRepairEnforcesMaximumRepairAttempts(t *testing.T) {
+	var out bytes.Buffer
+	agent := &repairingQueryDraftAgent{
+		generateDraft: queryDraft{Query: "StormEvents | where Bad0 == 'WA' | take 5"},
+		repairDrafts: []queryDraft{
+			{Query: "StormEvents | where Bad1 == 'WA' | take 5"},
+			{Query: "StormEvents | where Bad2 == 'WA' | take 5"},
+			{Query: "StormEvents | where Bad3 == 'WA' | take 5"},
+		},
+	}
+	planCalls := 0
+	s := &server{
+		cfg:              config{serviceURI: "https://help.kusto.windows.net", database: "Samples", output: "json"},
+		queryDraftAgent:  agent,
+		schemaDiscoverer: &fakeSchemaDiscoverer{ctx: fakeStormSchemaContext()},
+		executeHook: func(_ context.Context, _, _, csl, kind string, _ bool, _ map[string]any) (kustoResponse, error) {
+			if kind == "query" {
+				return kustoResponse{}, errors.New("execution should not run after max Repair Passes are exhausted")
+			}
+			planCalls++
+			return kustoResponse{}, errors.New("Semantic error while validating: " + csl)
+		},
+		stdout: &out,
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.runCommand(context.Background(), []string{"ask", "--execute", "--repair", "--max-repair-attempts=2", "show", "WA", "storms"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(agent.repairCalls) != 2 {
+		t.Fatalf("Repair Passes = %d; want strict max of 2", len(agent.repairCalls))
+	}
+	if planCalls != 3 {
+		t.Fatalf("plan validation calls = %d; want initial plus two repaired drafts", planCalls)
+	}
+	var draft queryDraft
+	if err := json.Unmarshal(out.Bytes(), &draft); err != nil {
+		t.Fatalf("unmarshal Query Draft: %v\n%s", err, out.String())
+	}
+	if draft.Query != "StormEvents | where Bad2 == 'WA' | take 5" {
+		t.Fatalf("query = %q; want last draft from second Repair Pass", draft.Query)
+	}
+	if len(draft.RepairHistory) != 2 || draft.RepairHistory[1].Attempt != 2 || strings.Contains(out.String(), "Bad3") {
+		t.Fatalf("repair history/output = %#v; want exactly two Repair Passes and no third draft", draft.RepairHistory)
+	}
+	if draft.Execution.Executed {
+		t.Fatalf("execution = %#v; want not executed", draft.Execution)
 	}
 }
 
