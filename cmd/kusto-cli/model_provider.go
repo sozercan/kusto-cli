@@ -170,6 +170,7 @@ func (fakeModelProvider) GenerateQueryDraft(_ context.Context, req queryDraftReq
 			"Review the Query Draft before using an execution gate.",
 		},
 		SchemaContext:  req.SchemaContext,
+		Examples:       req.Examples,
 		DataDisclosure: req.DataDisclosure,
 	}, nil
 }
@@ -195,6 +196,7 @@ func (fakeModelProvider) RepairQueryDraft(_ context.Context, req queryDraftRepai
 			"Repair Pass used validation errors and Schema Context only; review the Query Draft before execution.",
 		},
 		SchemaContext:  req.SchemaContext,
+		Examples:       req.Examples,
 		DataDisclosure: req.DataDisclosure,
 	}, nil
 }
@@ -285,6 +287,7 @@ func openAIQueryDraftMessages(req queryDraftRequest) []openAIChatMessage {
 				"Return only JSON matching the requested schema.",
 				"Generate one read-only KQL query for the provided Target and natural-language prompt.",
 				"Use the provided Schema Context; do not invent private cluster, database, or customer details.",
+				"Use any provided examples only as read-only KQL shape guidance; adapt table and column names to the Schema Context instead of copying unrelated example identifiers.",
 				"If ambiguity blocks a safe table or function choice, set clarification_required true, ask one concise clarification_question, and leave query empty.",
 				"If ambiguity is non-blocking, set clarification_required false and record explicit assumptions.",
 				"Do not execute queries. The CLI will run independent validation after your advisory model_safety classification.",
@@ -305,7 +308,8 @@ func openAIQueryDraftRepairMessages(req queryDraftRepairRequest) []openAIChatMes
 			Content: strings.Join([]string{
 				"You are the Query Draft Agent for kusto-cli performing exactly one Repair Pass.",
 				"Return only JSON matching the requested schema.",
-				"Repair the previous read-only KQL query using only the Target, original prompt, Schema Context, and validation error.",
+				"Repair the previous read-only KQL query using only the Target, original prompt, Schema Context, examples, and validation error.",
+				"Use examples only as read-only KQL shape guidance; adapt identifiers to the Schema Context.",
 				"Do not execute queries, request sample data, infer from query results, or invent private cluster, database, or customer details.",
 				"If the validation error cannot be safely repaired from the Schema Context, set clarification_required true, ask one concise clarification_question, and leave query empty.",
 				"The CLI will run independent static and Kusto-side validation after this Repair Pass.",

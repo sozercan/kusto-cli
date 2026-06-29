@@ -39,7 +39,10 @@ const (
 	defaultSchemaContextSampleRows = 3
 	defaultAskExecutionMaxRecords  = 100
 	defaultAskRepairMaxAttempts    = 1
+	defaultQueryDraftShotsLimit    = 5
 	maxAskRepairMaxAttempts        = 5
+	maxQueryDraftShotsLimit        = 20
+	maxBundledQueryDraftExamples   = 3
 	maxSchemaContextTables         = 5
 	maxSchemaContextFunctions      = 3
 	maxSchemaContextColumns        = 24
@@ -150,6 +153,7 @@ type queryDraftRequest struct {
 	Target         queryDraftTarget          `json:"target"`
 	Prompt         string                    `json:"prompt"`
 	SchemaContext  []queryDraftSchemaContext `json:"schema_context"`
+	Examples       []queryDraftExample       `json:"examples,omitempty"`
 	DataDisclosure queryDraftDataDisclosure  `json:"data_disclosure_policy"`
 }
 
@@ -162,6 +166,7 @@ type queryDraft struct {
 	ClarificationQuestion string                    `json:"clarification_question,omitempty"`
 	Assumptions           []string                  `json:"assumptions"`
 	Warnings              []string                  `json:"warnings"`
+	Examples              []queryDraftExample       `json:"examples,omitempty"`
 	SchemaContext         []queryDraftSchemaContext `json:"schema_context"`
 	DataDisclosure        queryDraftDataDisclosure  `json:"data_disclosure_policy"`
 	Validation            queryDraftValidation      `json:"validation"`
@@ -184,6 +189,7 @@ type queryDraftRepairRequest struct {
 	Target            queryDraftTarget          `json:"target"`
 	Prompt            string                    `json:"prompt"`
 	SchemaContext     []queryDraftSchemaContext `json:"schema_context"`
+	Examples          []queryDraftExample       `json:"examples,omitempty"`
 	DataDisclosure    queryDraftDataDisclosure  `json:"data_disclosure_policy"`
 	PreviousQuery     string                    `json:"previous_query"`
 	ValidationError   string                    `json:"validation_error"`
@@ -196,6 +202,13 @@ type queryDraftModelSafety struct {
 	Classification string `json:"classification,omitempty"`
 	Reason         string `json:"reason,omitempty"`
 	Advisory       bool   `json:"advisory,omitempty"`
+}
+
+type queryDraftExample struct {
+	Source string `json:"source"`
+	Name   string `json:"name,omitempty"`
+	Intent string `json:"intent"`
+	Query  string `json:"query"`
 }
 
 type queryDraftSchemaContext struct {
@@ -474,6 +487,10 @@ type askTargetSelection struct {
 	MaxRecords        int
 	MaxRepairAttempts int
 	MaxRepairSet      bool
+	ShotsTableName    string
+	ShotsTableSet     bool
+	ShotsLimit        int
+	ShotsLimitSet     bool
 }
 
 type askTargetCandidate struct {
@@ -497,8 +514,9 @@ func (s *server) runAskCommand(ctx context.Context, args []string) error {
 		return err
 	}
 	schemaContext, schemaErr := s.discoverQueryDraftSchemaContext(ctx, target, prompt, selection)
-	disclosure := buildDataDisclosureReport(selection.IncludeSampleRows, schemaContext)
-	req := queryDraftRequest{Target: target, Prompt: prompt, SchemaContext: schemaContexts(schemaContext), DataDisclosure: disclosure}
+	examples, exampleWarnings := s.queryDraftExamples(ctx, target, prompt, selection)
+	disclosure := buildDataDisclosureReport(selection.IncludeSampleRows, schemaContext, len(examples) > 0)
+	req := queryDraftRequest{Target: target, Prompt: prompt, SchemaContext: schemaContexts(schemaContext), Examples: examples, DataDisclosure: disclosure}
 	agent, err := s.queryDraftAgentForAsk()
 	if err != nil {
 		return err
@@ -511,6 +529,7 @@ func (s *server) runAskCommand(ctx context.Context, args []string) error {
 	if schemaErr != nil {
 		draft.Warnings = append(draft.Warnings, "Schema Context discovery failed; Query Draft may be less accurate: "+schemaErr.Error())
 	}
+	draft.Warnings = append(draft.Warnings, exampleWarnings...)
 	s.applyQueryPlanValidationAndRepair(ctx, &draft, req, agent, selection)
 	s.applyExecutionGate(ctx, &draft, selection)
 	return writeQueryDraft(s.output(), s.cfg.output, draft)
@@ -666,6 +685,42 @@ func parseAskArgs(args []string) (askTargetSelection, string, error) {
 			}
 			selection.IncludeSampleRows = value
 			i++
+		case arg == "--shots-table":
+			if i+1 >= len(args) {
+				return selection, "", errors.New("--shots-table requires a value")
+			}
+			selection.ShotsTableName = strings.TrimSpace(args[i+1])
+			if selection.ShotsTableName == "" {
+				return selection, "", errors.New("--shots-table requires a non-empty value")
+			}
+			selection.ShotsTableSet = true
+			i += 2
+		case strings.HasPrefix(arg, "--shots-table="):
+			selection.ShotsTableName = strings.TrimSpace(strings.TrimPrefix(arg, "--shots-table="))
+			if selection.ShotsTableName == "" {
+				return selection, "", errors.New("--shots-table requires a non-empty value")
+			}
+			selection.ShotsTableSet = true
+			i++
+		case arg == "--shots-limit":
+			if i+1 >= len(args) {
+				return selection, "", errors.New("--shots-limit requires a value")
+			}
+			limit, err := parseAskShotsLimit(args[i+1], arg)
+			if err != nil {
+				return selection, "", err
+			}
+			selection.ShotsLimit = limit
+			selection.ShotsLimitSet = true
+			i += 2
+		case strings.HasPrefix(arg, "--shots-limit="):
+			limit, err := parseAskShotsLimit(strings.TrimPrefix(arg, "--shots-limit="), "--shots-limit")
+			if err != nil {
+				return selection, "", err
+			}
+			selection.ShotsLimit = limit
+			selection.ShotsLimitSet = true
+			i++
 		default:
 			promptArgs = append(promptArgs, args[i:]...)
 			i = len(args)
@@ -687,6 +742,20 @@ func parseAskExecutionMaxRecords(value, flagName string) (int, error) {
 		return 0, fmt.Errorf("%s requires a value greater than zero", flagName)
 	}
 	return maxRecords, nil
+}
+
+func parseAskShotsLimit(value, flagName string) (int, error) {
+	limit, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return 0, fmt.Errorf("%s requires an integer value: %w", flagName, err)
+	}
+	if limit <= 0 {
+		return 0, fmt.Errorf("%s requires a value greater than zero", flagName)
+	}
+	if limit > maxQueryDraftShotsLimit {
+		return 0, fmt.Errorf("%s must be %d or less", flagName, maxQueryDraftShotsLimit)
+	}
+	return limit, nil
 }
 
 func parseAskRepairMaxAttempts(value, flagName string) (int, error) {
@@ -904,6 +973,9 @@ func normalizeQueryDraft(draft *queryDraft, req queryDraftRequest) {
 	if draft.Warnings == nil {
 		draft.Warnings = []string{}
 	}
+	if draft.Examples == nil || (len(draft.Examples) == 0 && len(req.Examples) > 0) {
+		draft.Examples = req.Examples
+	}
 	if draft.SchemaContext == nil || (len(draft.SchemaContext) == 0 && len(req.SchemaContext) > 0) {
 		draft.SchemaContext = req.SchemaContext
 	}
@@ -925,7 +997,14 @@ func normalizeQueryDraft(draft *queryDraft, req queryDraftRequest) {
 		draft.DataDisclosure = req.DataDisclosure
 	}
 	if draft.DataDisclosure.Mode == "" {
-		draft.DataDisclosure = buildDataDisclosureReport(false, queryDraftSchemaContext{})
+		draft.DataDisclosure = buildDataDisclosureReport(false, queryDraftSchemaContext{}, false)
+	}
+	if req.DataDisclosure.Mode != "" {
+		draft.DataDisclosure.Mode = req.DataDisclosure.Mode
+		draft.DataDisclosure.Sent.Schema = req.DataDisclosure.Sent.Schema
+		draft.DataDisclosure.Sent.Docstrings = req.DataDisclosure.Sent.Docstrings
+		draft.DataDisclosure.Sent.Shots = req.DataDisclosure.Sent.Shots
+		draft.DataDisclosure.Sent.SampleRows = req.DataDisclosure.Sent.SampleRows
 	}
 	draft.DataDisclosure.Sent.QueryResults = false
 	draft.ClarificationQuestion = strings.TrimSpace(draft.ClarificationQuestion)
@@ -1037,6 +1116,7 @@ func (s *server) applyQueryPlanValidationAndRepair(ctx context.Context, draft *q
 			Target:            req.Target,
 			Prompt:            req.Prompt,
 			SchemaContext:     req.SchemaContext,
+			Examples:          req.Examples,
 			DataDisclosure:    req.DataDisclosure,
 			PreviousQuery:     strings.TrimSpace(draft.Query),
 			ValidationError:   validationError,
@@ -1158,6 +1238,169 @@ func (emptySchemaDiscoverer) DiscoverSchemaContext(context.Context, schemaDiscov
 	return queryDraftSchemaContext{}, nil
 }
 
+func (s *server) queryDraftExamples(ctx context.Context, target queryDraftTarget, prompt string, selection askTargetSelection) ([]queryDraftExample, []string) {
+	bundled := bundledQueryDraftExamples(prompt)
+	configured, warnings, err := s.configuredQueryDraftShots(ctx, target, prompt, selection)
+	if err != nil {
+		warnings = append(warnings, "Configured shots retrieval failed; continuing with bundled examples only: "+err.Error())
+	}
+	examples := make([]queryDraftExample, 0, len(configured)+len(bundled))
+	examples = append(examples, configured...)
+	examples = append(examples, bundled...)
+	return examples, warnings
+}
+
+func bundledQueryDraftExamples(prompt string) []queryDraftExample {
+	all := []queryDraftExample{
+		{
+			Source: "bundled",
+			Name:   "recent_rows",
+			Intent: "Return recent rows with an explicit result bound.",
+			Query:  "StormEvents\n| where StartTime > ago(1d)\n| project StartTime, State, EventType\n| take 100",
+		},
+		{
+			Source: "bundled",
+			Name:   "filter_project_take",
+			Intent: "Filter rows, select relevant columns, and cap returned records.",
+			Query:  "StormEvents\n| where State == 'WA'\n| project StartTime, State, EventType\n| take 100",
+		},
+		{
+			Source: "bundled",
+			Name:   "summarize_count_by_dimension",
+			Intent: "Count rows by a categorical column and return the most common values.",
+			Query:  "StormEvents\n| summarize EventCount = count() by State\n| top 10 by EventCount desc",
+		},
+		{
+			Source: "bundled",
+			Name:   "time_series_count",
+			Intent: "Summarize rows into time buckets for a trend.",
+			Query:  "StormEvents\n| summarize EventCount = count() by bin(StartTime, 1d)\n| order by StartTime desc\n| take 30",
+		},
+		{
+			Source: "bundled",
+			Name:   "distinct_values",
+			Intent: "List distinct values from a column with an explicit cap.",
+			Query:  "StormEvents\n| summarize by EventType\n| take 100",
+		},
+	}
+	tokens := promptTokens(prompt)
+	type scoredExample struct {
+		example queryDraftExample
+		score   int
+		idx     int
+	}
+	scored := make([]scoredExample, 0, len(all))
+	for i, example := range all {
+		scored = append(scored, scoredExample{example: example, score: scoreText(example.Name+" "+example.Intent+" "+example.Query, tokens), idx: i})
+	}
+	sort.SliceStable(scored, func(i, j int) bool {
+		if scored[i].score != scored[j].score {
+			return scored[i].score > scored[j].score
+		}
+		return scored[i].idx < scored[j].idx
+	})
+	limit := min(maxBundledQueryDraftExamples, len(scored))
+	examples := make([]queryDraftExample, 0, limit)
+	for i := 0; i < limit; i++ {
+		examples = append(examples, scored[i].example)
+	}
+	return examples
+}
+
+func (s *server) configuredQueryDraftShots(ctx context.Context, target queryDraftTarget, prompt string, selection askTargetSelection) ([]queryDraftExample, []string, error) {
+	tableName := strings.TrimSpace(selection.ShotsTableName)
+	if tableName == "" && !selection.ShotsTableSet {
+		tableName = strings.TrimSpace(os.Getenv("KUSTO_SHOTS_TABLE"))
+	}
+	if tableName == "" {
+		return nil, nil, nil
+	}
+	limit := selection.ShotsLimit
+	if limit <= 0 {
+		limit = defaultQueryDraftShotsLimit
+	}
+	query := queryDraftShotsQuery(tableName, prompt, limit)
+	resp, err := s.executeKusto(ctx, target.ClusterURI, target.Database, query, "query", true, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	examples, warnings := queryDraftExamplesFromShotsResponse(resp)
+	return examples, warnings, nil
+}
+
+func queryDraftShotsQuery(tableName, prompt string, limit int) string {
+	if limit <= 0 {
+		limit = defaultQueryDraftShotsLimit
+	}
+	return fmt.Sprintf("%s | where * has %s | take %d", kqlEscapeEntityName(tableName), kqlStringLiteral(prompt), limit)
+}
+
+func queryDraftExamplesFromShotsResponse(resp kustoResponse) ([]queryDraftExample, []string) {
+	rows := rowsToDicts(resp)
+	examples := make([]queryDraftExample, 0, len(rows))
+	warnings := []string{}
+	for i, row := range rows {
+		example, ok := queryDraftExampleFromShotRow(row)
+		if !ok {
+			warnings = append(warnings, fmt.Sprintf("Configured shot row %d did not include a KQL query; skipped.", i+1))
+			continue
+		}
+		if err := validateQueryDraftExample(example.Query); err != nil {
+			warnings = append(warnings, fmt.Sprintf("Configured shot %q is not a safe read-only Query Draft example; skipped: %v", firstNonEmpty(example.Name, example.Intent, fmt.Sprintf("row %d", i+1)), err))
+			continue
+		}
+		examples = append(examples, example)
+	}
+	return examples, warnings
+}
+
+func queryDraftExampleFromShotRow(row map[string]any) (queryDraftExample, bool) {
+	query := firstRowString(row, "query", "kql", "csl", "kusto_query", "query_text", "example_query")
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return queryDraftExample{}, false
+	}
+	intent := firstRowString(row, "intent", "prompt", "question", "description", "request", "natural_language")
+	name := firstRowString(row, "name", "title", "id", "example", "example_name")
+	intent = strings.TrimSpace(intent)
+	name = strings.TrimSpace(name)
+	if intent == "" {
+		intent = firstNonEmpty(name, "Configured Query Draft shot")
+	}
+	return queryDraftExample{Source: "configured", Name: name, Intent: intent, Query: query}, true
+}
+
+func firstRowString(row map[string]any, names ...string) string {
+	for _, name := range names {
+		for key, value := range row {
+			if !strings.EqualFold(key, name) || value == nil {
+				continue
+			}
+			switch v := value.(type) {
+			case string:
+				return v
+			case json.Number:
+				return v.String()
+			default:
+				return fmt.Sprint(v)
+			}
+		}
+	}
+	return ""
+}
+
+func validateQueryDraftExample(query string) error {
+	validation := validateQueryDraftSafety(queryDraft{Query: query})
+	if validation.SafeForExecution {
+		return nil
+	}
+	messages := queryDraftValidationMessages(validation)
+	if len(messages) == 0 {
+		return errors.New("validation did not pass")
+	}
+	return errors.New(strings.Join(messages, "; "))
+}
+
 func schemaContexts(schemaContext queryDraftSchemaContext) []queryDraftSchemaContext {
 	if schemaContextEmpty(schemaContext) {
 		return []queryDraftSchemaContext{}
@@ -1190,7 +1433,7 @@ func applyDataDisclosurePolicy(schemaContext queryDraftSchemaContext, includeSam
 	return schemaContext
 }
 
-func buildDataDisclosureReport(includeSampleRows bool, schemaContext queryDraftSchemaContext) queryDraftDataDisclosure {
+func buildDataDisclosureReport(includeSampleRows bool, schemaContext queryDraftSchemaContext, includeShots bool) queryDraftDataDisclosure {
 	mode := dataDisclosureModeSchemaOnly
 	if includeSampleRows {
 		mode = dataDisclosureModeSchemaAndSamples
@@ -1200,7 +1443,7 @@ func buildDataDisclosureReport(includeSampleRows bool, schemaContext queryDraftS
 		Sent: queryDraftDataDisclosureSent{
 			Schema:       schemaContextHasSchema(schemaContext),
 			Docstrings:   schemaContextHasDocstrings(schemaContext),
-			Shots:        false,
+			Shots:        includeShots,
 			SampleRows:   schemaContextHasSampleRows(schemaContext),
 			QueryResults: false,
 		},
@@ -2235,8 +2478,8 @@ func (s *server) runAPICommand(ctx context.Context, args []string) error {
 
 func printKustoUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
-  kusto-cli --service-uri <cluster> --database <db> ask [--include-samples] [--validate-plan] [--repair] [--max-repair-attempts N] [--execute] [--max-rows N] '<natural-language prompt>'
-  kusto-cli --target <alias> ask [--include-samples] [--validate-plan] [--repair] [--max-repair-attempts N] [--execute] [--max-rows N] '<natural-language prompt>'
+  kusto-cli --service-uri <cluster> --database <db> ask [--include-samples] [--shots-table <table>] [--shots-limit N] [--validate-plan] [--repair] [--max-repair-attempts N] [--execute] [--max-rows N] '<natural-language prompt>'
+  kusto-cli --target <alias> ask [--include-samples] [--shots-table <table>] [--shots-limit N] [--validate-plan] [--repair] [--max-repair-attempts N] [--execute] [--max-rows N] '<natural-language prompt>'
   kusto-cli --service-uri <cluster> --database <db> query '<kql>'
   kusto-cli databases list
   kusto-cli tables list
@@ -2312,6 +2555,13 @@ func writeQueryDraft(w io.Writer, format string, draft queryDraft) error {
 		fmt.Fprintf(w, "Query:\n%s\n\n", draft.Query)
 		writeBullets(w, "Assumptions", draft.Assumptions)
 		writeBullets(w, "Warnings", draft.Warnings)
+		if len(draft.Examples) > 0 {
+			fmt.Fprintln(w, "Examples sent to model provider:")
+			for _, example := range draft.Examples {
+				label := firstNonEmpty(example.Name, example.Intent, "example")
+				fmt.Fprintf(w, "- %s/%s: %s\n", example.Source, label, oneLine(example.Intent))
+			}
+		}
 		fmt.Fprintf(w, "Data Disclosure Policy: %s\n", draft.DataDisclosure.Mode)
 		fmt.Fprintf(w, "Sent to model provider: schema=%t docstrings=%t shots=%t sample_rows=%t query_results=%t\n", draft.DataDisclosure.Sent.Schema, draft.DataDisclosure.Sent.Docstrings, draft.DataDisclosure.Sent.Shots, draft.DataDisclosure.Sent.SampleRows, draft.DataDisclosure.Sent.QueryResults)
 		if draft.ModelSafety != nil && (draft.ModelSafety.Classification != "" || draft.ModelSafety.Reason != "") {
@@ -2391,6 +2641,9 @@ func writeQueryDraft(w io.Writer, format string, draft queryDraft) error {
 		}
 		fmt.Fprintf(w, "assumptions\t%s\n", oneLine(strings.Join(draft.Assumptions, "; ")))
 		fmt.Fprintf(w, "warnings\t%s\n", oneLine(strings.Join(draft.Warnings, "; ")))
+		if len(draft.Examples) > 0 {
+			fmt.Fprintf(w, "examples\t%s\n", oneLine(string(mustJSON(draft.Examples))))
+		}
 		fmt.Fprintf(w, "data_disclosure_policy.mode\t%s\n", oneLine(draft.DataDisclosure.Mode))
 		fmt.Fprintf(w, "data_disclosure_policy.sent.schema\t%t\n", draft.DataDisclosure.Sent.Schema)
 		fmt.Fprintf(w, "data_disclosure_policy.sent.docstrings\t%t\n", draft.DataDisclosure.Sent.Docstrings)
@@ -2921,9 +3174,9 @@ func (s *server) callTool(ctx context.Context, name string, raw json.RawMessage)
 			return "[]", nil
 		}
 		if a.SampleSize <= 0 {
-			a.SampleSize = 5
+			a.SampleSize = defaultQueryDraftShotsLimit
 		}
-		query := fmt.Sprintf("%s | where * has %s | take %d", kqlEscapeEntityName(a.ShotsTableName), strconv.Quote(a.Prompt), a.SampleSize)
+		query := queryDraftShotsQuery(a.ShotsTableName, a.Prompt, a.SampleSize)
 		resp, err := s.execute(ctx, a.ClusterURI, a.Database, query, "query", true, a.ClientRequestProperties)
 		return marshalKusto(resp, err)
 	case "kusto_show_queryplan":

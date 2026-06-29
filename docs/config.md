@@ -58,3 +58,11 @@ kusto-cli config set model-api-key-env OPENAI_API_KEY
 ```
 
 The config stores only the environment variable name, not the API key value. API keys are sent as bearer credentials to the model provider and are not included in normal `ask` output. Model safety classifications in provider output are advisory; `kusto-cli` still applies its own Query Draft validation and execution remains gated.
+
+## Query Draft examples and configured shots
+
+`ask` includes a small bundled set of generic, public read-only KQL examples so model providers can follow common shapes such as filtering, projecting, counting, and time bucketing. These examples use only public sample-style identifiers and must be adapted to the active Schema Context.
+
+If you maintain your own examples table, configure it per invocation with `ask --shots-table <table>` or through `KUSTO_SHOTS_TABLE`. `ask` retrieves matching rows with a deterministic `where * has <prompt> | take N` query; set `--shots-limit N` to adjust the default limit of 5. Missing shot configuration is ignored. If configured shot retrieval fails, `ask` returns the Query Draft with bundled examples and a warning instead of failing.
+
+The Query Draft output reports examples under `examples`, and `data_disclosure_policy.sent_to_model_provider.shots` is `true` whenever bundled examples or configured shots were sent to the model provider.

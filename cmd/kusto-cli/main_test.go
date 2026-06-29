@@ -7,9 +7,15 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 )
+
+func TestMain(m *testing.M) {
+	_ = os.Unsetenv("KUSTO_SHOTS_TABLE")
+	os.Exit(m.Run())
+}
 
 type recordingQueryDraftAgent struct {
 	called bool
@@ -286,6 +292,12 @@ func TestAskUsesFakedQueryDraftAgentAndWritesStableJSON(t *testing.T) {
 	if schemaDiscoverer.req.IncludeSampleRows {
 		t.Fatal("sample rows were requested without explicit opt-in")
 	}
+	if len(agent.req.Examples) == 0 || agent.req.Examples[0].Source != "bundled" {
+		t.Fatalf("examples sent to Query Draft Agent = %#v; want bundled examples", agent.req.Examples)
+	}
+	if !agent.req.DataDisclosure.Sent.Shots {
+		t.Fatal("Data Disclosure Policy did not report bundled examples as shots sent to the model provider")
+	}
 
 	want := `{
   "format": "query_draft",
@@ -300,6 +312,26 @@ func TestAskUsesFakedQueryDraftAgentAndWritesStableJSON(t *testing.T) {
   ],
   "warnings": [
     "Fake agent response for deterministic tests."
+  ],
+  "examples": [
+    {
+      "source": "bundled",
+      "name": "recent_rows",
+      "intent": "Return recent rows with an explicit result bound.",
+      "query": "StormEvents\n| where StartTime > ago(1d)\n| project StartTime, State, EventType\n| take 100"
+    },
+    {
+      "source": "bundled",
+      "name": "filter_project_take",
+      "intent": "Filter rows, select relevant columns, and cap returned records.",
+      "query": "StormEvents\n| where State == 'WA'\n| project StartTime, State, EventType\n| take 100"
+    },
+    {
+      "source": "bundled",
+      "name": "summarize_count_by_dimension",
+      "intent": "Count rows by a categorical column and return the most common values.",
+      "query": "StormEvents\n| summarize EventCount = count() by State\n| top 10 by EventCount desc"
+    }
   ],
   "schema_context": [
     {
@@ -352,7 +384,7 @@ func TestAskUsesFakedQueryDraftAgentAndWritesStableJSON(t *testing.T) {
     "sent_to_model_provider": {
       "schema": true,
       "docstrings": true,
-      "shots": false,
+      "shots": true,
       "sample_rows": false,
       "query_results": false
     }
@@ -410,6 +442,186 @@ func TestAskUsesFakedQueryDraftAgentAndWritesStableJSON(t *testing.T) {
 	}
 	if strings.Contains(out.String(), "Hail") {
 		t.Fatal("ask output included raw sample row values without explicit opt-in")
+	}
+}
+
+func TestAskInvalidShotsLimitReturnsUsageError(t *testing.T) {
+	var out bytes.Buffer
+	s := &server{
+		cfg:    config{serviceURI: "https://help.kusto.windows.net", database: "Samples", output: "json"},
+		stdout: &out,
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	err := s.runCommand(context.Background(), []string{"ask", "--shots-limit=abc", "show", "storm", "events"})
+	if err == nil || !strings.Contains(err.Error(), "--shots-limit requires an integer value") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("invalid shots flag wrote output: %q", out.String())
+	}
+}
+
+func TestAskRetrievesConfiguredShots(t *testing.T) {
+	var out bytes.Buffer
+	agent := &recordingQueryDraftAgent{}
+	shotsQueries := []string{}
+	s := &server{
+		cfg:              config{serviceURI: "https://help.kusto.windows.net", database: "Samples", output: "json"},
+		queryDraftAgent:  agent,
+		schemaDiscoverer: &fakeSchemaDiscoverer{ctx: fakeStormSchemaContext()},
+		executeHook: func(_ context.Context, clusterURI, database, csl, kind string, readonly bool, _ map[string]any) (kustoResponse, error) {
+			if clusterURI != "https://help.kusto.windows.net" || database != "Samples" || kind != "query" || !readonly {
+				t.Fatalf("shots query execution = cluster=%q database=%q kind=%q readonly=%t", clusterURI, database, kind, readonly)
+			}
+			shotsQueries = append(shotsQueries, csl)
+			return makeKustoResponse(
+				[]kustoColumn{{ColumnName: "Name", ColumnType: "string"}, {ColumnName: "Prompt", ColumnType: "string"}, {ColumnName: "Query", ColumnType: "string"}},
+				[][]any{{"wa_storms", "show WA storms", "StormEvents\n| where State == 'WA'\n| take 10"}},
+			), nil
+		},
+		stdout: &out,
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.runCommand(context.Background(), []string{"ask", "--shots-table", "QueryShots", "--shots-limit", "2", "show", "storm", "events"}); err != nil {
+		t.Fatal(err)
+	}
+	if !agent.called {
+		t.Fatal("Query Draft Agent was not called")
+	}
+	if len(shotsQueries) != 1 {
+		t.Fatalf("shots queries = %#v; want exactly one configured shots query", shotsQueries)
+	}
+	if !strings.Contains(shotsQueries[0], "['QueryShots']") || !strings.Contains(shotsQueries[0], "'show storm events'") || !strings.Contains(shotsQueries[0], "take 2") {
+		t.Fatalf("shots query = %q; want table, prompt, and configured limit", shotsQueries[0])
+	}
+	if len(agent.req.Examples) < 2 || agent.req.Examples[0].Source != "configured" || agent.req.Examples[0].Name != "wa_storms" {
+		t.Fatalf("examples sent to Query Draft Agent = %#v; want configured shot before bundled examples", agent.req.Examples)
+	}
+	if agent.req.Examples[0].Query != "StormEvents\n| where State == 'WA'\n| take 10" {
+		t.Fatalf("configured shot query = %q", agent.req.Examples[0].Query)
+	}
+	if !agent.req.DataDisclosure.Sent.Shots {
+		t.Fatal("Data Disclosure Policy did not report configured shots sent to the model provider")
+	}
+	var draft queryDraft
+	if err := json.Unmarshal(out.Bytes(), &draft); err != nil {
+		t.Fatalf("unmarshal Query Draft: %v\n%s", err, out.String())
+	}
+	if len(draft.Examples) == 0 || draft.Examples[0].Source != "configured" {
+		t.Fatalf("output examples = %#v; want configured shot reported", draft.Examples)
+	}
+}
+
+func TestAskMissingConfiguredShotsStillUsesBundledExamples(t *testing.T) {
+	var out bytes.Buffer
+	agent := &recordingQueryDraftAgent{}
+	executed := false
+	s := &server{
+		cfg:              config{serviceURI: "https://help.kusto.windows.net", database: "Samples", output: "json"},
+		queryDraftAgent:  agent,
+		schemaDiscoverer: &fakeSchemaDiscoverer{ctx: fakeStormSchemaContext()},
+		executeHook: func(context.Context, string, string, string, string, bool, map[string]any) (kustoResponse, error) {
+			executed = true
+			return kustoResponse{}, nil
+		},
+		stdout: &out,
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.runCommand(context.Background(), []string{"ask", "show", "storm", "events"}); err != nil {
+		t.Fatal(err)
+	}
+	if executed {
+		t.Fatal("ask queried a configured shots source even though none was configured")
+	}
+	if len(agent.req.Examples) == 0 || agent.req.Examples[0].Source != "bundled" {
+		t.Fatalf("examples = %#v; want bundled examples when configured shots are missing", agent.req.Examples)
+	}
+	var draft queryDraft
+	if err := json.Unmarshal(out.Bytes(), &draft); err != nil {
+		t.Fatal(err)
+	}
+	if !draft.DataDisclosure.Sent.Shots || len(draft.Examples) == 0 {
+		t.Fatalf("disclosure/examples = %#v / %#v; want bundled examples reported as shots", draft.DataDisclosure, draft.Examples)
+	}
+	if containsString(draft.Warnings, "Configured shots") {
+		t.Fatalf("warnings = %#v; missing shots configuration should not warn", draft.Warnings)
+	}
+}
+
+func TestAskConfiguredShotsFailureWarnsAndContinues(t *testing.T) {
+	var out bytes.Buffer
+	agent := &recordingQueryDraftAgent{}
+	s := &server{
+		cfg:              config{serviceURI: "https://help.kusto.windows.net", database: "Samples", output: "json"},
+		queryDraftAgent:  agent,
+		schemaDiscoverer: &fakeSchemaDiscoverer{ctx: fakeStormSchemaContext()},
+		executeHook: func(context.Context, string, string, string, string, bool, map[string]any) (kustoResponse, error) {
+			return kustoResponse{}, errors.New("shots table unavailable")
+		},
+		stdout: &out,
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.runCommand(context.Background(), []string{"ask", "--shots-table", "QueryShots", "show", "storm", "events"}); err != nil {
+		t.Fatal(err)
+	}
+	if !agent.called {
+		t.Fatal("Query Draft Agent was not called after shots retrieval failed")
+	}
+	if len(agent.req.Examples) == 0 || agent.req.Examples[0].Source != "bundled" {
+		t.Fatalf("examples = %#v; want bundled examples after configured shots failure", agent.req.Examples)
+	}
+	var draft queryDraft
+	if err := json.Unmarshal(out.Bytes(), &draft); err != nil {
+		t.Fatal(err)
+	}
+	if !containsString(draft.Warnings, "Configured shots retrieval failed") {
+		t.Fatalf("warnings = %#v; want configured shots warning", draft.Warnings)
+	}
+}
+
+func TestBundledQueryDraftExamplesArePublicReadOnlyKQL(t *testing.T) {
+	examples := bundledQueryDraftExamples("count recent events by state")
+	if len(examples) == 0 {
+		t.Fatal("expected bundled Query Draft examples")
+	}
+	for _, example := range examples {
+		if example.Source != "bundled" {
+			t.Fatalf("example source = %q; want bundled", example.Source)
+		}
+		if err := validateQueryDraftExample(example.Query); err != nil {
+			t.Fatalf("bundled example %q is not safe read-only KQL: %v", example.Name, err)
+		}
+		lower := strings.ToLower(example.Intent + " " + example.Query)
+		for _, forbidden := range []string{"cluster", "database", "customer", "incident", "internal"} {
+			if strings.Contains(lower, forbidden) {
+				t.Fatalf("bundled example %q contains forbidden public-doc term %q: %s", example.Name, forbidden, example.Query)
+			}
+		}
+	}
+}
+
+func TestConfiguredShotsUnsafeQueriesAreNotSent(t *testing.T) {
+	resp := makeKustoResponse(
+		[]kustoColumn{{ColumnName: "Name", ColumnType: "string"}, {ColumnName: "Prompt", ColumnType: "string"}, {ColumnName: "Query", ColumnType: "string"}},
+		[][]any{
+			{"drop_table", "delete old data", ".drop table StormEvents"},
+			{"safe_take", "show rows", "StormEvents | take 5"},
+		},
+	)
+	examples, warnings := queryDraftExamplesFromShotsResponse(resp)
+	if len(examples) != 1 || examples[0].Name != "safe_take" {
+		t.Fatalf("examples = %#v; want only safe read-only shot", examples)
+	}
+	if !containsString(warnings, "not a safe read-only Query Draft example") {
+		t.Fatalf("warnings = %#v; want unsafe shot warning", warnings)
 	}
 }
 
@@ -764,6 +976,9 @@ func TestAskRepairUsesPlanValidationErrorAndExecutesRepairedDraft(t *testing.T) 
 	}
 	if len(req.SchemaContext) != 1 || len(req.SchemaContext[0].Tables) != 1 || len(req.SchemaContext[0].Tables[0].SampleRows) != 0 {
 		t.Fatalf("repair Schema Context = %#v; want schema-only context without sample rows", req.SchemaContext)
+	}
+	if len(req.Examples) == 0 || req.Examples[0].Source != "bundled" || !req.DataDisclosure.Sent.Shots {
+		t.Fatalf("repair examples/disclosure = %#v / %#v; want examples sent and disclosed as shots", req.Examples, req.DataDisclosure)
 	}
 	var draft queryDraft
 	if err := json.Unmarshal(out.Bytes(), &draft); err != nil {
@@ -1214,6 +1429,9 @@ func TestAskOpenAICompatibleModelProviderProducesQueryDraft(t *testing.T) {
 		}
 		if !strings.Contains(got.Messages[len(got.Messages)-1].Content, "StormEvents") {
 			t.Error("model provider request did not include Schema Context")
+		}
+		if !strings.Contains(got.Messages[len(got.Messages)-1].Content, "\"examples\"") || !strings.Contains(got.Messages[len(got.Messages)-1].Content, "recent_rows") {
+			t.Error("model provider request did not include Query Draft examples")
 		}
 
 		w.Header().Set("Content-Type", "application/json")
