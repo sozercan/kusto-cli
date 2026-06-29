@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,14 @@ const (
 	defaultProtocolVer   = "2025-06-18"
 	defaultKustoDB       = "NetDefaultDB"
 	defaultKustoResource = "https://kusto.kusto.windows.net"
+
+	dataDisclosureModeSchemaOnly       = "schema-only"
+	dataDisclosureModeSchemaAndSamples = "schema-and-sample-rows"
+
+	defaultSchemaContextSampleRows = 3
+	maxSchemaContextTables         = 5
+	maxSchemaContextFunctions      = 3
+	maxSchemaContextColumns        = 24
 )
 
 type config struct {
@@ -56,13 +65,14 @@ type config struct {
 }
 
 type server struct {
-	cfg             config
-	hc              *http.Client
-	auth            *tokenProvider
-	queryDraftAgent queryDraftAgent
-	stdout          io.Writer
-	knownServices   []KustoServiceConfig
-	defaultSvc      *KustoServiceConfig
+	cfg              config
+	hc               *http.Client
+	auth             *tokenProvider
+	queryDraftAgent  queryDraftAgent
+	schemaDiscoverer schemaDiscoverer
+	stdout           io.Writer
+	knownServices    []KustoServiceConfig
+	defaultSvc       *KustoServiceConfig
 }
 
 type tokenProvider struct {
@@ -128,25 +138,66 @@ type queryDraftTarget struct {
 }
 
 type queryDraftRequest struct {
-	Target queryDraftTarget `json:"target"`
-	Prompt string           `json:"prompt"`
+	Target         queryDraftTarget          `json:"target"`
+	Prompt         string                    `json:"prompt"`
+	SchemaContext  []queryDraftSchemaContext `json:"schema_context"`
+	DataDisclosure queryDraftDataDisclosure  `json:"data_disclosure_policy"`
 }
 
 type queryDraft struct {
-	Format        string                    `json:"format"`
-	Target        queryDraftTarget          `json:"target"`
-	Prompt        string                    `json:"prompt"`
-	Query         string                    `json:"query"`
-	Assumptions   []string                  `json:"assumptions"`
-	Warnings      []string                  `json:"warnings"`
-	SchemaContext []queryDraftSchemaContext `json:"schema_context"`
-	Validation    queryDraftValidation      `json:"validation"`
-	Execution     queryDraftExecution       `json:"execution"`
+	Format         string                    `json:"format"`
+	Target         queryDraftTarget          `json:"target"`
+	Prompt         string                    `json:"prompt"`
+	Query          string                    `json:"query"`
+	Assumptions    []string                  `json:"assumptions"`
+	Warnings       []string                  `json:"warnings"`
+	SchemaContext  []queryDraftSchemaContext `json:"schema_context"`
+	DataDisclosure queryDraftDataDisclosure  `json:"data_disclosure_policy"`
+	Validation     queryDraftValidation      `json:"validation"`
+	Execution      queryDraftExecution       `json:"execution"`
 }
 
 type queryDraftSchemaContext struct {
-	Source   string   `json:"source"`
-	Entities []string `json:"entities"`
+	Source    string                     `json:"source"`
+	Entities  []string                   `json:"entities"`
+	Tables    []queryDraftSchemaTable    `json:"tables,omitempty"`
+	Functions []queryDraftSchemaFunction `json:"functions,omitempty"`
+	Truncated bool                       `json:"truncated,omitempty"`
+	Warnings  []string                   `json:"warnings,omitempty"`
+}
+
+type queryDraftSchemaTable struct {
+	EntityType string                   `json:"-"`
+	Name       string                   `json:"name"`
+	DocString  string                   `json:"docstring,omitempty"`
+	Columns    []queryDraftSchemaColumn `json:"columns"`
+	SampleRows []map[string]any         `json:"sample_rows,omitempty"`
+}
+
+type queryDraftSchemaColumn struct {
+	Name      string `json:"name"`
+	Type      string `json:"type"`
+	DocString string `json:"docstring,omitempty"`
+}
+
+type queryDraftSchemaFunction struct {
+	Name          string                   `json:"name"`
+	DocString     string                   `json:"docstring,omitempty"`
+	InputSchema   string                   `json:"input_schema,omitempty"`
+	OutputColumns []queryDraftSchemaColumn `json:"output_columns,omitempty"`
+}
+
+type queryDraftDataDisclosure struct {
+	Mode string                       `json:"mode"`
+	Sent queryDraftDataDisclosureSent `json:"sent_to_model_provider"`
+}
+
+type queryDraftDataDisclosureSent struct {
+	Schema       bool `json:"schema"`
+	Docstrings   bool `json:"docstrings"`
+	Shots        bool `json:"shots"`
+	SampleRows   bool `json:"sample_rows"`
+	QueryResults bool `json:"query_results"`
 }
 
 type queryDraftValidation struct {
@@ -172,6 +223,23 @@ type queryDraftAgent interface {
 }
 
 type fakeQueryDraftAgent struct{}
+
+type schemaDiscoverer interface {
+	DiscoverSchemaContext(context.Context, schemaDiscoveryRequest) (queryDraftSchemaContext, error)
+}
+
+type schemaDiscoveryRequest struct {
+	Target            queryDraftTarget
+	Prompt            string
+	IncludeSampleRows bool
+	SampleRowLimit    int
+}
+
+type emptySchemaDiscoverer struct{}
+
+type kustoSchemaDiscoverer struct {
+	server *server
+}
 
 func main() {
 	cfg := parseFlags()
@@ -228,6 +296,7 @@ func run(ctx context.Context, cfg config) error {
 		queryDraftAgent: fakeQueryDraftAgent{},
 		stdout:          os.Stdout,
 	}
+	s.schemaDiscoverer = kustoSchemaDiscoverer{server: s}
 	if err := s.loadKnownServices(); err != nil {
 		return err
 	}
@@ -325,11 +394,12 @@ func (s *server) runCommand(ctx context.Context, args []string) error {
 }
 
 type askTargetSelection struct {
-	Alias         string
-	ServiceURI    string
-	Database      string
-	ServiceURISet bool
-	DatabaseSet   bool
+	Alias             string
+	ServiceURI        string
+	Database          string
+	ServiceURISet     bool
+	DatabaseSet       bool
+	IncludeSampleRows bool
 }
 
 type askTargetCandidate struct {
@@ -348,15 +418,21 @@ func (s *server) runAskCommand(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	schemaContext, schemaErr := s.discoverQueryDraftSchemaContext(ctx, target, prompt, selection)
+	disclosure := buildDataDisclosureReport(selection.IncludeSampleRows, schemaContext)
+	req := queryDraftRequest{Target: target, Prompt: prompt, SchemaContext: schemaContexts(schemaContext), DataDisclosure: disclosure}
 	agent := s.queryDraftAgent
 	if agent == nil {
 		agent = fakeQueryDraftAgent{}
 	}
-	draft, err := agent.GenerateQueryDraft(ctx, queryDraftRequest{Target: target, Prompt: prompt})
+	draft, err := agent.GenerateQueryDraft(ctx, req)
 	if err != nil {
 		return err
 	}
-	normalizeQueryDraft(&draft, target, prompt)
+	normalizeQueryDraft(&draft, req)
+	if schemaErr != nil {
+		draft.Warnings = append(draft.Warnings, "Schema Context discovery failed; Query Draft may be less accurate: "+schemaErr.Error())
+	}
 	return writeQueryDraft(s.output(), s.cfg.output, draft)
 }
 
@@ -415,6 +491,23 @@ func parseAskArgs(args []string) (askTargetSelection, string, error) {
 		case strings.HasPrefix(arg, "--database="):
 			selection.Database = strings.TrimPrefix(arg, "--database=")
 			selection.DatabaseSet = true
+			i++
+		case arg == "--include-samples" || arg == "--include-sample-rows":
+			selection.IncludeSampleRows = true
+			i++
+		case strings.HasPrefix(arg, "--include-samples="):
+			value, err := strconv.ParseBool(strings.TrimPrefix(arg, "--include-samples="))
+			if err != nil {
+				return selection, "", fmt.Errorf("--include-samples requires a boolean value: %w", err)
+			}
+			selection.IncludeSampleRows = value
+			i++
+		case strings.HasPrefix(arg, "--include-sample-rows="):
+			value, err := strconv.ParseBool(strings.TrimPrefix(arg, "--include-sample-rows="))
+			if err != nil {
+				return selection, "", fmt.Errorf("--include-sample-rows requires a boolean value: %w", err)
+			}
+			selection.IncludeSampleRows = value
 			i++
 		default:
 			promptArgs = append(promptArgs, args[i:]...)
@@ -575,28 +668,29 @@ func (fakeQueryDraftAgent) GenerateQueryDraft(_ context.Context, req queryDraftR
 		Query:  "search " + kqlStringLiteral(prompt) + "\n| take 10",
 		Assumptions: []string{
 			"Generated by the fake Query Draft Agent tracer bullet.",
-			"No live schema discovery or model provider was used.",
+			"No real model provider was used.",
 		},
 		Warnings: []string{
 			"Generated KQL was not executed.",
 			"Review the Query Draft before using an execution gate.",
 		},
-		SchemaContext: []queryDraftSchemaContext{},
+		SchemaContext:  req.SchemaContext,
+		DataDisclosure: req.DataDisclosure,
 	}, nil
 }
 
-func normalizeQueryDraft(draft *queryDraft, target queryDraftTarget, prompt string) {
+func normalizeQueryDraft(draft *queryDraft, req queryDraftRequest) {
 	if draft.Format == "" {
 		draft.Format = "query_draft"
 	}
 	if draft.Target.ClusterURI == "" {
-		draft.Target.ClusterURI = target.ClusterURI
+		draft.Target.ClusterURI = req.Target.ClusterURI
 	}
 	if draft.Target.Database == "" {
-		draft.Target.Database = target.Database
+		draft.Target.Database = req.Target.Database
 	}
 	if draft.Prompt == "" {
-		draft.Prompt = prompt
+		draft.Prompt = req.Prompt
 	}
 	if draft.Assumptions == nil {
 		draft.Assumptions = []string{}
@@ -604,13 +698,28 @@ func normalizeQueryDraft(draft *queryDraft, target queryDraftTarget, prompt stri
 	if draft.Warnings == nil {
 		draft.Warnings = []string{}
 	}
+	if draft.SchemaContext == nil || (len(draft.SchemaContext) == 0 && len(req.SchemaContext) > 0) {
+		draft.SchemaContext = req.SchemaContext
+	}
 	if draft.SchemaContext == nil {
 		draft.SchemaContext = []queryDraftSchemaContext{}
 	}
 	for i := range draft.SchemaContext {
 		if draft.SchemaContext[i].Entities == nil {
+			draft.SchemaContext[i].Entities = schemaContextEntities(draft.SchemaContext[i])
+		}
+		if draft.SchemaContext[i].Entities == nil {
 			draft.SchemaContext[i].Entities = []string{}
 		}
+		if draft.SchemaContext[i].Warnings != nil && len(draft.SchemaContext[i].Warnings) == 0 {
+			draft.SchemaContext[i].Warnings = nil
+		}
+	}
+	if draft.DataDisclosure.Mode == "" {
+		draft.DataDisclosure = req.DataDisclosure
+	}
+	if draft.DataDisclosure.Mode == "" {
+		draft.DataDisclosure = buildDataDisclosureReport(false, queryDraftSchemaContext{})
 	}
 	draft.Validation = validateQueryDraftShape(draft.Query)
 	if draft.Validation.Status != "passed" {
@@ -620,6 +729,533 @@ func normalizeQueryDraft(draft *queryDraft, target queryDraftTarget, prompt stri
 	if draft.Execution.Reason == "" {
 		draft.Execution.Reason = "generate-only; execution requires an explicit execution gate"
 	}
+}
+
+func (s *server) discoverQueryDraftSchemaContext(ctx context.Context, target queryDraftTarget, prompt string, selection askTargetSelection) (queryDraftSchemaContext, error) {
+	discoverer := s.schemaDiscoverer
+	if discoverer == nil {
+		discoverer = emptySchemaDiscoverer{}
+	}
+	schemaContext, err := discoverer.DiscoverSchemaContext(ctx, schemaDiscoveryRequest{
+		Target:            target,
+		Prompt:            prompt,
+		IncludeSampleRows: selection.IncludeSampleRows,
+		SampleRowLimit:    defaultSchemaContextSampleRows,
+	})
+	schemaContext = applyDataDisclosurePolicy(schemaContext, selection.IncludeSampleRows)
+	if schemaContext.Entities == nil {
+		schemaContext.Entities = schemaContextEntities(schemaContext)
+	}
+	return schemaContext, err
+}
+
+func (emptySchemaDiscoverer) DiscoverSchemaContext(context.Context, schemaDiscoveryRequest) (queryDraftSchemaContext, error) {
+	return queryDraftSchemaContext{}, nil
+}
+
+func schemaContexts(schemaContext queryDraftSchemaContext) []queryDraftSchemaContext {
+	if schemaContextEmpty(schemaContext) {
+		return []queryDraftSchemaContext{}
+	}
+	return []queryDraftSchemaContext{schemaContext}
+}
+
+func schemaContextEmpty(schemaContext queryDraftSchemaContext) bool {
+	return strings.TrimSpace(schemaContext.Source) == "" && len(schemaContext.Entities) == 0 && len(schemaContext.Tables) == 0 && len(schemaContext.Functions) == 0 && len(schemaContext.Warnings) == 0
+}
+
+func schemaContextEntities(schemaContext queryDraftSchemaContext) []string {
+	entities := []string{}
+	for _, table := range schemaContext.Tables {
+		entities = appendUniqueString(entities, table.Name)
+	}
+	for _, fn := range schemaContext.Functions {
+		entities = appendUniqueString(entities, fn.Name)
+	}
+	return entities
+}
+
+func applyDataDisclosurePolicy(schemaContext queryDraftSchemaContext, includeSampleRows bool) queryDraftSchemaContext {
+	if includeSampleRows {
+		return schemaContext
+	}
+	for i := range schemaContext.Tables {
+		schemaContext.Tables[i].SampleRows = nil
+	}
+	return schemaContext
+}
+
+func buildDataDisclosureReport(includeSampleRows bool, schemaContext queryDraftSchemaContext) queryDraftDataDisclosure {
+	mode := dataDisclosureModeSchemaOnly
+	if includeSampleRows {
+		mode = dataDisclosureModeSchemaAndSamples
+	}
+	return queryDraftDataDisclosure{
+		Mode: mode,
+		Sent: queryDraftDataDisclosureSent{
+			Schema:       schemaContextHasSchema(schemaContext),
+			Docstrings:   schemaContextHasDocstrings(schemaContext),
+			Shots:        false,
+			SampleRows:   schemaContextHasSampleRows(schemaContext),
+			QueryResults: false,
+		},
+	}
+}
+
+func schemaContextHasSchema(schemaContext queryDraftSchemaContext) bool {
+	if len(schemaContext.Entities) > 0 || len(schemaContext.Tables) > 0 || len(schemaContext.Functions) > 0 {
+		return true
+	}
+	for _, table := range schemaContext.Tables {
+		if len(table.Columns) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func schemaContextHasDocstrings(schemaContext queryDraftSchemaContext) bool {
+	for _, table := range schemaContext.Tables {
+		if strings.TrimSpace(table.DocString) != "" {
+			return true
+		}
+		for _, column := range table.Columns {
+			if strings.TrimSpace(column.DocString) != "" {
+				return true
+			}
+		}
+	}
+	for _, fn := range schemaContext.Functions {
+		if strings.TrimSpace(fn.DocString) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func schemaContextHasSampleRows(schemaContext queryDraftSchemaContext) bool {
+	for _, table := range schemaContext.Tables {
+		if len(table.SampleRows) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (d kustoSchemaDiscoverer) DiscoverSchemaContext(ctx context.Context, req schemaDiscoveryRequest) (queryDraftSchemaContext, error) {
+	if d.server == nil {
+		return queryDraftSchemaContext{}, nil
+	}
+	text, err := d.server.callTool(ctx, "kusto_describe_database", mustMarshal(map[string]any{
+		"cluster_uri": req.Target.ClusterURI,
+		"database":    req.Target.Database,
+	}))
+	if err != nil {
+		return queryDraftSchemaContext{}, err
+	}
+	var resp kustoResponse
+	if err := json.Unmarshal([]byte(text), &resp); err != nil {
+		return queryDraftSchemaContext{}, fmt.Errorf("parse schema discovery response: %w", err)
+	}
+	catalog := schemaCatalogFromKustoResponse(resp)
+	schemaContext := compactSchemaCatalog(catalog, req.Prompt)
+	if schemaContext.Source == "" {
+		schemaContext.Source = "target-schema"
+	}
+	if !req.IncludeSampleRows || len(schemaContext.Tables) == 0 {
+		return schemaContext, nil
+	}
+	limit := req.SampleRowLimit
+	if limit <= 0 {
+		limit = defaultSchemaContextSampleRows
+	}
+	for i := range schemaContext.Tables {
+		rows, sampleErr := d.sampleTableRows(ctx, req.Target, schemaContext.Tables[i], limit)
+		if sampleErr != nil {
+			schemaContext.Warnings = append(schemaContext.Warnings, fmt.Sprintf("sample rows unavailable for %s: %v", schemaContext.Tables[i].Name, sampleErr))
+			continue
+		}
+		schemaContext.Tables[i].SampleRows = rows
+	}
+	return schemaContext, nil
+}
+
+func (d kustoSchemaDiscoverer) sampleTableRows(ctx context.Context, target queryDraftTarget, table queryDraftSchemaTable, limit int) ([]map[string]any, error) {
+	entityType := table.EntityType
+	if entityType == "" {
+		entityType = "table"
+	}
+	text, err := d.server.callTool(ctx, "kusto_sample_entity", mustMarshal(map[string]any{
+		"cluster_uri": target.ClusterURI,
+		"database":    target.Database,
+		"entity_type": entityType,
+		"entity_name": table.Name,
+		"sample_size": limit,
+	}))
+	if err != nil {
+		return nil, err
+	}
+	var resp kustoResponse
+	if err := json.Unmarshal([]byte(text), &resp); err != nil {
+		return nil, fmt.Errorf("parse sample rows response: %w", err)
+	}
+	rows := rowsToDicts(resp)
+	if len(rows) > limit {
+		rows = rows[:limit]
+	}
+	return rows, nil
+}
+
+type schemaCatalog struct {
+	Tables    []queryDraftSchemaTable
+	Functions []queryDraftSchemaFunction
+}
+
+func schemaCatalogFromKustoResponse(resp kustoResponse) schemaCatalog {
+	columnIndex := map[string]int{}
+	for i, column := range resp.Data.Columns {
+		columnIndex[strings.ToLower(column.ColumnName)] = i
+	}
+	value := func(row []any, names ...string) string {
+		for _, name := range names {
+			idx, ok := columnIndex[strings.ToLower(name)]
+			if !ok || idx >= len(row) || row[idx] == nil {
+				continue
+			}
+			return strings.TrimSpace(fmt.Sprint(row[idx]))
+		}
+		return ""
+	}
+	catalog := schemaCatalog{}
+	for _, row := range resp.Data.Rows {
+		name := value(row, "EntityName", "Name", "TableName", "FunctionName")
+		if name == "" {
+			continue
+		}
+		entityType := normalizeSchemaEntityType(value(row, "EntityType", "Kind", "Type"))
+		docString := value(row, "DocString", "Docstring", "Description")
+		inputSchema := value(row, "CslInputSchema", "InputSchema", "Schema")
+		outputSchema := value(row, "CslOutputSchema", "OutputSchema")
+		switch entityType {
+		case "table", "external-table", "materialized-view":
+			columns := parseCSLColumns(firstNonEmpty(outputSchema, inputSchema, value(row, "Content")))
+			catalog.Tables = append(catalog.Tables, queryDraftSchemaTable{EntityType: entityType, Name: name, DocString: docString, Columns: columns})
+		case "function":
+			catalog.Functions = append(catalog.Functions, queryDraftSchemaFunction{
+				Name:          name,
+				DocString:     docString,
+				InputSchema:   inputSchema,
+				OutputColumns: parseCSLColumns(outputSchema),
+			})
+		}
+	}
+	return catalog
+}
+
+func normalizeSchemaEntityType(entityType string) string {
+	compact := strings.ToLower(strings.TrimSpace(entityType))
+	compact = strings.ReplaceAll(compact, "_", "")
+	compact = strings.ReplaceAll(compact, "-", "")
+	compact = strings.ReplaceAll(compact, " ", "")
+	switch compact {
+	case "table", "tables":
+		return "table"
+	case "externaltable", "externaltables":
+		return "external-table"
+	case "materializedview", "materializedviews", "mv", "mvs":
+		return "materialized-view"
+	case "function", "functions", "storedfunction", "storedfunctions":
+		return "function"
+	default:
+		return compact
+	}
+}
+
+func compactSchemaCatalog(catalog schemaCatalog, prompt string) queryDraftSchemaContext {
+	tokens := promptTokens(prompt)
+	tables, tablesTruncated := compactTables(catalog.Tables, tokens)
+	functions, functionsTruncated := compactFunctions(catalog.Functions, tokens)
+	schemaContext := queryDraftSchemaContext{
+		Source:    "target-schema",
+		Tables:    tables,
+		Functions: functions,
+		Truncated: tablesTruncated || functionsTruncated,
+	}
+	schemaContext.Entities = schemaContextEntities(schemaContext)
+	return schemaContext
+}
+
+func compactTables(tables []queryDraftSchemaTable, tokens []string) ([]queryDraftSchemaTable, bool) {
+	if len(tables) == 0 {
+		return nil, false
+	}
+	type scoredTable struct {
+		table queryDraftSchemaTable
+		score int
+		idx   int
+	}
+	scored := make([]scoredTable, 0, len(tables))
+	for i, table := range tables {
+		score := scoreTable(table, tokens)
+		table.Columns = compactColumns(table.Columns, tokens)
+		scored = append(scored, scoredTable{table: table, score: score, idx: i})
+	}
+	sort.SliceStable(scored, func(i, j int) bool {
+		if scored[i].score != scored[j].score {
+			return scored[i].score > scored[j].score
+		}
+		return strings.ToLower(scored[i].table.Name) < strings.ToLower(scored[j].table.Name)
+	})
+	hasPositiveScore := false
+	for _, candidate := range scored {
+		if candidate.score > 0 {
+			hasPositiveScore = true
+			break
+		}
+	}
+	selected := make([]queryDraftSchemaTable, 0, min(len(scored), maxSchemaContextTables))
+	for _, candidate := range scored {
+		if len(selected) >= maxSchemaContextTables {
+			break
+		}
+		if len(tokens) > 0 && hasPositiveScore && candidate.score == 0 {
+			continue
+		}
+		selected = append(selected, candidate.table)
+	}
+	if len(selected) == 0 && len(scored) > 0 {
+		limit := min(len(scored), maxSchemaContextTables)
+		for i := 0; i < limit; i++ {
+			selected = append(selected, scored[i].table)
+		}
+	}
+	truncated := len(selected) < len(tables)
+	for _, table := range selected {
+		if len(table.Columns) == maxSchemaContextColumns {
+			for _, original := range tables {
+				if original.Name == table.Name && len(original.Columns) > maxSchemaContextColumns {
+					truncated = true
+					break
+				}
+			}
+		}
+	}
+	return selected, truncated
+}
+
+func compactFunctions(functions []queryDraftSchemaFunction, tokens []string) ([]queryDraftSchemaFunction, bool) {
+	if len(functions) == 0 {
+		return nil, false
+	}
+	type scoredFunction struct {
+		function queryDraftSchemaFunction
+		score    int
+	}
+	scored := make([]scoredFunction, 0, len(functions))
+	for _, fn := range functions {
+		scored = append(scored, scoredFunction{function: fn, score: scoreFunction(fn, tokens)})
+	}
+	sort.SliceStable(scored, func(i, j int) bool {
+		if scored[i].score != scored[j].score {
+			return scored[i].score > scored[j].score
+		}
+		return strings.ToLower(scored[i].function.Name) < strings.ToLower(scored[j].function.Name)
+	})
+	selected := []queryDraftSchemaFunction{}
+	for _, candidate := range scored {
+		if len(selected) >= maxSchemaContextFunctions {
+			break
+		}
+		if len(tokens) > 0 && candidate.score == 0 {
+			continue
+		}
+		selected = append(selected, candidate.function)
+	}
+	return selected, len(selected) < len(functions)
+}
+
+func compactColumns(columns []queryDraftSchemaColumn, tokens []string) []queryDraftSchemaColumn {
+	if len(columns) <= maxSchemaContextColumns {
+		if columns == nil {
+			return []queryDraftSchemaColumn{}
+		}
+		return columns
+	}
+	type scoredColumn struct {
+		column queryDraftSchemaColumn
+		score  int
+		idx    int
+	}
+	scored := make([]scoredColumn, 0, len(columns))
+	for i, column := range columns {
+		scored = append(scored, scoredColumn{column: column, score: scoreText(column.Name+" "+column.DocString, tokens), idx: i})
+	}
+	sort.SliceStable(scored, func(i, j int) bool {
+		if scored[i].score != scored[j].score {
+			return scored[i].score > scored[j].score
+		}
+		return scored[i].idx < scored[j].idx
+	})
+	selected := scored[:maxSchemaContextColumns]
+	sort.SliceStable(selected, func(i, j int) bool { return selected[i].idx < selected[j].idx })
+	out := make([]queryDraftSchemaColumn, 0, len(selected))
+	for _, candidate := range selected {
+		out = append(out, candidate.column)
+	}
+	return out
+}
+
+func scoreTable(table queryDraftSchemaTable, tokens []string) int {
+	score := scoreText(table.Name, tokens) * 5
+	score += scoreText(table.DocString, tokens) * 2
+	for _, column := range table.Columns {
+		score += scoreText(column.Name, tokens)
+		score += scoreText(column.DocString, tokens)
+	}
+	return score
+}
+
+func scoreFunction(fn queryDraftSchemaFunction, tokens []string) int {
+	score := scoreText(fn.Name, tokens) * 5
+	score += scoreText(fn.DocString, tokens) * 2
+	score += scoreText(fn.InputSchema, tokens)
+	for _, column := range fn.OutputColumns {
+		score += scoreText(column.Name, tokens)
+	}
+	return score
+}
+
+func scoreText(text string, tokens []string) int {
+	if len(tokens) == 0 || strings.TrimSpace(text) == "" {
+		return 0
+	}
+	lower := strings.ToLower(text)
+	score := 0
+	for _, token := range tokens {
+		if strings.Contains(lower, token) {
+			score++
+		}
+	}
+	return score
+}
+
+func promptTokens(prompt string) []string {
+	seen := map[string]bool{}
+	tokens := []string{}
+	for _, field := range strings.FieldsFunc(strings.ToLower(prompt), func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
+	}) {
+		if len(field) < 2 || seen[field] {
+			continue
+		}
+		seen[field] = true
+		tokens = append(tokens, field)
+	}
+	return tokens
+}
+
+func parseCSLColumns(schema string) []queryDraftSchemaColumn {
+	schema = strings.TrimSpace(schema)
+	if schema == "" {
+		return []queryDraftSchemaColumn{}
+	}
+	if start := strings.Index(schema, "("); start >= 0 {
+		if end := strings.LastIndex(schema, ")"); end > start {
+			schema = schema[start+1 : end]
+		}
+	}
+	parts := splitTopLevel(schema, ',')
+	columns := []queryDraftSchemaColumn{}
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		colon := indexTopLevelColon(part)
+		if colon <= 0 {
+			continue
+		}
+		name := unquoteKQLIdentifier(part[:colon])
+		columnType := strings.TrimSpace(part[colon+1:])
+		if name == "" || columnType == "" {
+			continue
+		}
+		columns = append(columns, queryDraftSchemaColumn{Name: name, Type: columnType})
+	}
+	return columns
+}
+
+func splitTopLevel(s string, sep rune) []string {
+	parts := []string{}
+	start := 0
+	bracketDepth := 0
+	parenDepth := 0
+	inSingleQuote := false
+	for i, r := range s {
+		switch r {
+		case '\'':
+			inSingleQuote = !inSingleQuote
+		case '[':
+			if !inSingleQuote {
+				bracketDepth++
+			}
+		case ']':
+			if !inSingleQuote && bracketDepth > 0 {
+				bracketDepth--
+			}
+		case '(':
+			if !inSingleQuote {
+				parenDepth++
+			}
+		case ')':
+			if !inSingleQuote && parenDepth > 0 {
+				parenDepth--
+			}
+		default:
+			if r == sep && !inSingleQuote && bracketDepth == 0 && parenDepth == 0 {
+				parts = append(parts, s[start:i])
+				start = i + len(string(r))
+			}
+		}
+	}
+	parts = append(parts, s[start:])
+	return parts
+}
+
+func indexTopLevelColon(s string) int {
+	bracketDepth := 0
+	inSingleQuote := false
+	for i, r := range s {
+		switch r {
+		case '\'':
+			inSingleQuote = !inSingleQuote
+		case '[':
+			if !inSingleQuote {
+				bracketDepth++
+			}
+		case ']':
+			if !inSingleQuote && bracketDepth > 0 {
+				bracketDepth--
+			}
+		case ':':
+			if !inSingleQuote && bracketDepth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func unquoteKQLIdentifier(name string) string {
+	name = strings.TrimSpace(name)
+	if strings.HasPrefix(name, "['") && strings.HasSuffix(name, "']") {
+		return strings.ReplaceAll(name[2:len(name)-2], "''", "'")
+	}
+	if strings.HasPrefix(name, "[") && strings.HasSuffix(name, "]") {
+		name = strings.TrimSpace(name[1 : len(name)-1])
+	}
+	name = strings.Trim(name, "`\"'")
+	return strings.TrimSpace(name)
 }
 
 func validateQueryDraftShape(query string) queryDraftValidation {
@@ -804,8 +1440,8 @@ func (s *server) runAPICommand(ctx context.Context, args []string) error {
 
 func printKustoUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
-  kusto-cli --service-uri <cluster> --database <db> ask '<natural-language prompt>'
-  kusto-cli --target <alias> ask '<natural-language prompt>'
+  kusto-cli --service-uri <cluster> --database <db> ask [--include-samples] '<natural-language prompt>'
+  kusto-cli --target <alias> ask [--include-samples] '<natural-language prompt>'
   kusto-cli --service-uri <cluster> --database <db> query '<kql>'
   kusto-cli databases list
   kusto-cli tables list
@@ -878,6 +1514,8 @@ func writeQueryDraft(w io.Writer, format string, draft queryDraft) error {
 		fmt.Fprintf(w, "Query:\n%s\n\n", draft.Query)
 		writeBullets(w, "Assumptions", draft.Assumptions)
 		writeBullets(w, "Warnings", draft.Warnings)
+		fmt.Fprintf(w, "Data Disclosure Policy: %s\n", draft.DataDisclosure.Mode)
+		fmt.Fprintf(w, "Sent to model provider: schema=%t docstrings=%t shots=%t sample_rows=%t query_results=%t\n", draft.DataDisclosure.Sent.Schema, draft.DataDisclosure.Sent.Docstrings, draft.DataDisclosure.Sent.Shots, draft.DataDisclosure.Sent.SampleRows, draft.DataDisclosure.Sent.QueryResults)
 		fmt.Fprintf(w, "Validation: %s (read_only=%t)\n", draft.Validation.Status, draft.Validation.ReadOnly)
 		for _, check := range draft.Validation.Checks {
 			status := "failed"
@@ -900,6 +1538,12 @@ func writeQueryDraft(w io.Writer, format string, draft queryDraft) error {
 		fmt.Fprintf(w, "query\t%s\n", oneLine(draft.Query))
 		fmt.Fprintf(w, "assumptions\t%s\n", oneLine(strings.Join(draft.Assumptions, "; ")))
 		fmt.Fprintf(w, "warnings\t%s\n", oneLine(strings.Join(draft.Warnings, "; ")))
+		fmt.Fprintf(w, "data_disclosure_policy.mode\t%s\n", oneLine(draft.DataDisclosure.Mode))
+		fmt.Fprintf(w, "data_disclosure_policy.sent.schema\t%t\n", draft.DataDisclosure.Sent.Schema)
+		fmt.Fprintf(w, "data_disclosure_policy.sent.docstrings\t%t\n", draft.DataDisclosure.Sent.Docstrings)
+		fmt.Fprintf(w, "data_disclosure_policy.sent.shots\t%t\n", draft.DataDisclosure.Sent.Shots)
+		fmt.Fprintf(w, "data_disclosure_policy.sent.sample_rows\t%t\n", draft.DataDisclosure.Sent.SampleRows)
+		fmt.Fprintf(w, "data_disclosure_policy.sent.query_results\t%t\n", draft.DataDisclosure.Sent.QueryResults)
 		fmt.Fprintf(w, "validation.status\t%s\n", oneLine(draft.Validation.Status))
 		fmt.Fprintf(w, "validation.read_only\t%t\n", draft.Validation.ReadOnly)
 		fmt.Fprintf(w, "execution.executed\t%t\n", draft.Execution.Executed)

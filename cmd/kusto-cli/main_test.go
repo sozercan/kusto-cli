@@ -17,13 +17,55 @@ func (a *recordingQueryDraftAgent) GenerateQueryDraft(_ context.Context, req que
 	a.called = true
 	a.req = req
 	return queryDraft{
-		Query:       "StormEvents | take 5",
-		Assumptions: []string{"Using the public sample StormEvents table."},
-		Warnings:    []string{"Fake agent response for deterministic tests."},
-		SchemaContext: []queryDraftSchemaContext{
-			{Source: "fake-test", Entities: []string{"StormEvents"}},
-		},
+		Query:          "StormEvents | take 5",
+		Assumptions:    []string{"Using the public sample StormEvents table."},
+		Warnings:       []string{"Fake agent response for deterministic tests."},
+		SchemaContext:  req.SchemaContext,
+		DataDisclosure: req.DataDisclosure,
 	}, nil
+}
+
+type fakeSchemaDiscoverer struct {
+	called bool
+	req    schemaDiscoveryRequest
+	ctx    queryDraftSchemaContext
+	err    error
+}
+
+func (d *fakeSchemaDiscoverer) DiscoverSchemaContext(_ context.Context, req schemaDiscoveryRequest) (queryDraftSchemaContext, error) {
+	d.called = true
+	d.req = req
+	return d.ctx, d.err
+}
+
+func fakeStormSchemaContext() queryDraftSchemaContext {
+	return queryDraftSchemaContext{
+		Source:   "fake-schema",
+		Entities: []string{"StormEvents", "RecentStorms"},
+		Tables: []queryDraftSchemaTable{
+			{
+				Name:      "StormEvents",
+				DocString: "Public sample storm event records.",
+				Columns: []queryDraftSchemaColumn{
+					{Name: "StartTime", Type: "datetime"},
+					{Name: "State", Type: "string"},
+					{Name: "EventType", Type: "string"},
+				},
+				SampleRows: []map[string]any{{"State": "WA", "EventType": "Hail"}},
+			},
+		},
+		Functions: []queryDraftSchemaFunction{
+			{
+				Name:        "RecentStorms",
+				DocString:   "Returns recent public sample storm events.",
+				InputSchema: "()",
+				OutputColumns: []queryDraftSchemaColumn{
+					{Name: "StartTime", Type: "datetime"},
+					{Name: "State", Type: "string"},
+				},
+			},
+		},
+	}
 }
 
 func TestValidateQueryAndCommand(t *testing.T) {
@@ -126,10 +168,12 @@ func TestAskMissingPromptReturnsUsageError(t *testing.T) {
 func TestAskUsesFakedQueryDraftAgentAndWritesStableJSON(t *testing.T) {
 	var out bytes.Buffer
 	agent := &recordingQueryDraftAgent{}
+	schemaDiscoverer := &fakeSchemaDiscoverer{ctx: fakeStormSchemaContext()}
 	s := &server{
-		cfg:             config{serviceURI: "https://help.kusto.windows.net", database: "Samples", output: "json"},
-		queryDraftAgent: agent,
-		stdout:          &out,
+		cfg:              config{serviceURI: "https://help.kusto.windows.net", database: "Samples", output: "json"},
+		queryDraftAgent:  agent,
+		schemaDiscoverer: schemaDiscoverer,
+		stdout:           &out,
 	}
 	if err := s.loadKnownServices(); err != nil {
 		t.Fatal(err)
@@ -140,11 +184,17 @@ func TestAskUsesFakedQueryDraftAgentAndWritesStableJSON(t *testing.T) {
 	if !agent.called {
 		t.Fatal("fake Query Draft Agent was not called")
 	}
+	if !schemaDiscoverer.called {
+		t.Fatal("schema discoverer was not called")
+	}
 	if agent.req.Prompt != "show recent storm events" {
 		t.Fatalf("prompt = %q; want joined natural-language prompt", agent.req.Prompt)
 	}
 	if agent.req.Target.ClusterURI != "https://help.kusto.windows.net" || agent.req.Target.Database != "Samples" {
 		t.Fatalf("target = %#v; want public sample target", agent.req.Target)
+	}
+	if schemaDiscoverer.req.IncludeSampleRows {
+		t.Fatal("sample rows were requested without explicit opt-in")
 	}
 
 	want := `{
@@ -163,12 +213,60 @@ func TestAskUsesFakedQueryDraftAgentAndWritesStableJSON(t *testing.T) {
   ],
   "schema_context": [
     {
-      "source": "fake-test",
+      "source": "fake-schema",
       "entities": [
-        "StormEvents"
+        "StormEvents",
+        "RecentStorms"
+      ],
+      "tables": [
+        {
+          "name": "StormEvents",
+          "docstring": "Public sample storm event records.",
+          "columns": [
+            {
+              "name": "StartTime",
+              "type": "datetime"
+            },
+            {
+              "name": "State",
+              "type": "string"
+            },
+            {
+              "name": "EventType",
+              "type": "string"
+            }
+          ]
+        }
+      ],
+      "functions": [
+        {
+          "name": "RecentStorms",
+          "docstring": "Returns recent public sample storm events.",
+          "input_schema": "()",
+          "output_columns": [
+            {
+              "name": "StartTime",
+              "type": "datetime"
+            },
+            {
+              "name": "State",
+              "type": "string"
+            }
+          ]
+        }
       ]
     }
   ],
+  "data_disclosure_policy": {
+    "mode": "schema-only",
+    "sent_to_model_provider": {
+      "schema": true,
+      "docstrings": true,
+      "shots": false,
+      "sample_rows": false,
+      "query_results": false
+    }
+  },
   "validation": {
     "status": "passed",
     "read_only": true,
@@ -200,6 +298,129 @@ func TestAskUsesFakedQueryDraftAgentAndWritesStableJSON(t *testing.T) {
 	}
 	if _, ok := generic["execution_result"]; ok {
 		t.Fatal("ask output must not include an execution result")
+	}
+	if strings.Contains(out.String(), "Hail") {
+		t.Fatal("ask output included raw sample row values without explicit opt-in")
+	}
+}
+
+func TestAskSampleRowsRequireExplicitOptIn(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		args               []string
+		wantSampleRows     bool
+		wantDisclosureMode string
+	}{
+		{name: "default schema only", args: []string{"ask", "show", "storm", "events"}, wantSampleRows: false, wantDisclosureMode: dataDisclosureModeSchemaOnly},
+		{name: "explicit sample opt-in", args: []string{"ask", "--include-samples", "show", "storm", "events"}, wantSampleRows: true, wantDisclosureMode: dataDisclosureModeSchemaAndSamples},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			agent := &recordingQueryDraftAgent{}
+			schemaDiscoverer := &fakeSchemaDiscoverer{ctx: fakeStormSchemaContext()}
+			s := &server{
+				cfg:              config{serviceURI: "https://help.kusto.windows.net", database: "Samples", output: "json"},
+				queryDraftAgent:  agent,
+				schemaDiscoverer: schemaDiscoverer,
+				stdout:           &out,
+			}
+			if err := s.loadKnownServices(); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.runCommand(context.Background(), tc.args); err != nil {
+				t.Fatal(err)
+			}
+			if schemaDiscoverer.req.IncludeSampleRows != tc.wantSampleRows {
+				t.Fatalf("IncludeSampleRows = %t; want %t", schemaDiscoverer.req.IncludeSampleRows, tc.wantSampleRows)
+			}
+			if len(agent.req.SchemaContext) != 1 || len(agent.req.SchemaContext[0].Tables) != 1 {
+				t.Fatalf("agent schema context = %#v; want one fake table", agent.req.SchemaContext)
+			}
+			gotSamples := len(agent.req.SchemaContext[0].Tables[0].SampleRows) > 0
+			if gotSamples != tc.wantSampleRows {
+				t.Fatalf("sample rows sent to agent = %t; want %t", gotSamples, tc.wantSampleRows)
+			}
+			var draft queryDraft
+			if err := json.Unmarshal(out.Bytes(), &draft); err != nil {
+				t.Fatal(err)
+			}
+			if draft.DataDisclosure.Mode != tc.wantDisclosureMode {
+				t.Fatalf("disclosure mode = %q; want %q", draft.DataDisclosure.Mode, tc.wantDisclosureMode)
+			}
+			if draft.DataDisclosure.Sent.SampleRows != tc.wantSampleRows {
+				t.Fatalf("disclosure sample_rows = %t; want %t", draft.DataDisclosure.Sent.SampleRows, tc.wantSampleRows)
+			}
+			if draft.DataDisclosure.Sent.QueryResults {
+				t.Fatal("query results must not be sent to the model provider by default")
+			}
+		})
+	}
+}
+
+func TestCompactSchemaCatalogFocusesPromptAndCapsTables(t *testing.T) {
+	catalog := schemaCatalog{}
+	for _, name := range []string{"Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta"} {
+		catalog.Tables = append(catalog.Tables, queryDraftSchemaTable{
+			Name:      name,
+			DocString: "generic table",
+			Columns: []queryDraftSchemaColumn{
+				{Name: "Timestamp", Type: "datetime"},
+				{Name: "Value", Type: "string"},
+			},
+		})
+	}
+	catalog.Tables = append(catalog.Tables, queryDraftSchemaTable{
+		Name:      "StormEvents",
+		DocString: "storm event facts",
+		Columns: []queryDraftSchemaColumn{
+			{Name: "StartTime", Type: "datetime"},
+			{Name: "EventType", Type: "string"},
+		},
+	})
+	catalog.Functions = []queryDraftSchemaFunction{
+		{Name: "RecentStorms", DocString: "recent storm function", OutputColumns: []queryDraftSchemaColumn{{Name: "EventType", Type: "string"}}},
+		{Name: "UnrelatedHelper", DocString: "not relevant"},
+	}
+
+	ctx := compactSchemaCatalog(catalog, "recent storm events")
+	if len(ctx.Tables) != 1 || ctx.Tables[0].Name != "StormEvents" {
+		t.Fatalf("focused tables = %#v; want only StormEvents", ctx.Tables)
+	}
+	if len(ctx.Functions) != 1 || ctx.Functions[0].Name != "RecentStorms" {
+		t.Fatalf("focused functions = %#v; want RecentStorms", ctx.Functions)
+	}
+	if !ctx.Truncated {
+		t.Fatal("focused schema context should report truncation when unrelated entities are omitted")
+	}
+}
+
+func TestSchemaCatalogFromKustoResponseUsesSchemaAndFunctionMetadata(t *testing.T) {
+	resp := makeKustoResponse(
+		[]kustoColumn{
+			{ColumnName: "EntityName", ColumnType: "string"},
+			{ColumnName: "EntityType", ColumnType: "string"},
+			{ColumnName: "DocString", ColumnType: "string"},
+			{ColumnName: "CslInputSchema", ColumnType: "string"},
+			{ColumnName: "CslOutputSchema", ColumnType: "string"},
+		},
+		[][]any{
+			{"StormEvents", "Table", "Public sample storm events.", "StormEvents(StartTime:datetime, State:string, EventType:string)", ""},
+			{"RecentStorms", "Function", "Recent storms helper.", "(state:string)", "RecentStorms(StartTime:datetime, State:string)"},
+		},
+	)
+
+	catalog := schemaCatalogFromKustoResponse(resp)
+	if len(catalog.Tables) != 1 || catalog.Tables[0].Name != "StormEvents" || catalog.Tables[0].DocString == "" {
+		t.Fatalf("tables = %#v; want StormEvents with docstring", catalog.Tables)
+	}
+	if got := catalog.Tables[0].Columns; len(got) != 3 || got[0].Name != "StartTime" || got[0].Type != "datetime" {
+		t.Fatalf("table columns = %#v; want parsed Kusto column schema", got)
+	}
+	if len(catalog.Functions) != 1 || catalog.Functions[0].Name != "RecentStorms" || catalog.Functions[0].InputSchema != "(state:string)" {
+		t.Fatalf("functions = %#v; want RecentStorms metadata", catalog.Functions)
+	}
+	if got := catalog.Functions[0].OutputColumns; len(got) != 2 || got[1].Name != "State" || got[1].Type != "string" {
+		t.Fatalf("function output columns = %#v; want parsed output schema", got)
 	}
 }
 
