@@ -69,10 +69,12 @@ type openAIChatCompletionResponse struct {
 }
 
 type modelQueryDraftOutput struct {
-	Query       string                 `json:"query"`
-	Assumptions []string               `json:"assumptions"`
-	Warnings    []string               `json:"warnings"`
-	ModelSafety *queryDraftModelSafety `json:"model_safety,omitempty"`
+	Query                 string                 `json:"query"`
+	ClarificationRequired bool                   `json:"clarification_required,omitempty"`
+	ClarificationQuestion string                 `json:"clarification_question,omitempty"`
+	Assumptions           []string               `json:"assumptions"`
+	Warnings              []string               `json:"warnings"`
+	ModelSafety           *queryDraftModelSafety `json:"model_safety,omitempty"`
 }
 
 func (s *server) queryDraftAgentForAsk() (queryDraftAgent, error) {
@@ -238,6 +240,8 @@ func openAIQueryDraftMessages(req queryDraftRequest) []openAIChatMessage {
 				"Return only JSON matching the requested schema.",
 				"Generate one read-only KQL query for the provided Target and natural-language prompt.",
 				"Use the provided Schema Context; do not invent private cluster, database, or customer details.",
+				"If ambiguity blocks a safe table or function choice, set clarification_required true, ask one concise clarification_question, and leave query empty.",
+				"If ambiguity is non-blocking, set clarification_required false and record explicit assumptions.",
 				"Do not execute queries. The CLI will run independent validation after your advisory model_safety classification.",
 			}, " "),
 		},
@@ -258,7 +262,9 @@ func openAIQueryDraftResponseFormat() openAIChatResponseFormat {
 				"type":                 "object",
 				"additionalProperties": false,
 				"properties": map[string]any{
-					"query": map[string]any{"type": "string", "description": "Read-only KQL query text."},
+					"query":                  map[string]any{"type": "string", "description": "Read-only KQL query text, or empty when clarification_required is true."},
+					"clarification_required": map[string]any{"type": "boolean", "description": "True only when safe query drafting is blocked by ambiguity."},
+					"clarification_question": map[string]any{"type": "string", "description": "A concise question to unblock drafting, or empty when clarification_required is false."},
 					"assumptions": map[string]any{
 						"type":  "array",
 						"items": map[string]any{"type": "string"},
@@ -277,7 +283,7 @@ func openAIQueryDraftResponseFormat() openAIChatResponseFormat {
 						"required": []string{"classification", "reason"},
 					},
 				},
-				"required": []string{"query", "assumptions", "warnings", "model_safety"},
+				"required": []string{"query", "clarification_required", "clarification_question", "assumptions", "warnings", "model_safety"},
 			},
 		},
 	}
@@ -289,7 +295,11 @@ func parseModelQueryDraftOutput(content string) (queryDraft, error) {
 		return queryDraft{}, fmt.Errorf("model provider returned malformed structured output: %w", err)
 	}
 	out.Query = strings.TrimSpace(out.Query)
-	if out.Query == "" {
+	out.ClarificationQuestion = strings.TrimSpace(out.ClarificationQuestion)
+	if out.ClarificationRequired && out.ClarificationQuestion == "" {
+		return queryDraft{}, errors.New("model provider returned malformed structured output: clarification_question is required when clarification_required is true")
+	}
+	if out.Query == "" && !out.ClarificationRequired {
 		return queryDraft{}, errors.New("model provider returned malformed structured output: query is required")
 	}
 	if out.Assumptions == nil {
@@ -302,10 +312,12 @@ func parseModelQueryDraftOutput(content string) (queryDraft, error) {
 		out.ModelSafety.Advisory = true
 	}
 	return queryDraft{
-		Query:       out.Query,
-		Assumptions: out.Assumptions,
-		Warnings:    out.Warnings,
-		ModelSafety: out.ModelSafety,
+		Query:                 out.Query,
+		ClarificationRequired: out.ClarificationRequired,
+		ClarificationQuestion: out.ClarificationQuestion,
+		Assumptions:           out.Assumptions,
+		Warnings:              out.Warnings,
+		ModelSafety:           out.ModelSafety,
 	}, nil
 }
 

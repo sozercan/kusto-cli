@@ -27,6 +27,23 @@ func (a *recordingQueryDraftAgent) GenerateQueryDraft(_ context.Context, req que
 	}, nil
 }
 
+type scriptedQueryDraftAgent struct {
+	called bool
+	draft  queryDraft
+}
+
+func (a *scriptedQueryDraftAgent) GenerateQueryDraft(_ context.Context, req queryDraftRequest) (queryDraft, error) {
+	a.called = true
+	draft := a.draft
+	if draft.SchemaContext == nil {
+		draft.SchemaContext = req.SchemaContext
+	}
+	if draft.DataDisclosure.Mode == "" {
+		draft.DataDisclosure = req.DataDisclosure
+	}
+	return draft, nil
+}
+
 type fakeSchemaDiscoverer struct {
 	called bool
 	req    schemaDiscoveryRequest
@@ -38,6 +55,32 @@ func (d *fakeSchemaDiscoverer) DiscoverSchemaContext(_ context.Context, req sche
 	d.called = true
 	d.req = req
 	return d.ctx, d.err
+}
+
+func runAskWithDraft(t *testing.T, draft queryDraft) queryDraft {
+	t.Helper()
+	var out bytes.Buffer
+	agent := &scriptedQueryDraftAgent{draft: draft}
+	s := &server{
+		cfg:              config{serviceURI: "https://help.kusto.windows.net", database: "Samples", output: "json"},
+		queryDraftAgent:  agent,
+		schemaDiscoverer: &fakeSchemaDiscoverer{ctx: fakeStormSchemaContext()},
+		stdout:           &out,
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.runCommand(context.Background(), []string{"ask", "show", "storm", "events"}); err != nil {
+		t.Fatal(err)
+	}
+	if !agent.called {
+		t.Fatal("Query Draft Agent was not called")
+	}
+	var got queryDraft
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal Query Draft: %v\n%s", err, out.String())
+	}
+	return got
 }
 
 func fakeStormSchemaContext() queryDraftSchemaContext {
@@ -68,6 +111,15 @@ func fakeStormSchemaContext() queryDraftSchemaContext {
 			},
 		},
 	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if strings.Contains(value, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestValidateQueryAndCommand(t *testing.T) {
@@ -272,16 +324,35 @@ func TestAskUsesFakedQueryDraftAgentAndWritesStableJSON(t *testing.T) {
   "validation": {
     "status": "passed",
     "read_only": true,
+    "bounded": true,
+    "safe_for_execution": true,
     "checks": [
       {
         "name": "query_not_empty",
         "passed": true
       },
       {
-        "name": "not_management_command",
+        "name": "raw_kql_only",
+        "passed": true
+      },
+      {
+        "name": "no_management_commands",
+        "passed": true
+      },
+      {
+        "name": "no_write_capable_or_destructive_output",
+        "passed": true
+      },
+      {
+        "name": "safe_statement_shape",
+        "passed": true
+      },
+      {
+        "name": "bounded_result",
         "passed": true
       }
     ],
+    "warnings": [],
     "errors": []
   },
   "execution": {
@@ -303,6 +374,102 @@ func TestAskUsesFakedQueryDraftAgentAndWritesStableJSON(t *testing.T) {
 	}
 	if strings.Contains(out.String(), "Hail") {
 		t.Fatal("ask output included raw sample row values without explicit opt-in")
+	}
+}
+
+func TestAskBlocksManagementCommandDraftWithValidationMetadata(t *testing.T) {
+	draft := runAskWithDraft(t, queryDraft{
+		Query:       ".show tables",
+		Assumptions: []string{"The prompt might be asking for schema information."},
+		Warnings:    []string{},
+		ModelSafety: &queryDraftModelSafety{Classification: "safe", Reason: "Provider thought this was read-only."},
+	})
+	if draft.Validation.Status != "failed" {
+		t.Fatalf("validation status = %q; want failed", draft.Validation.Status)
+	}
+	if draft.Validation.ReadOnly || draft.Validation.SafeForExecution {
+		t.Fatalf("validation = %#v; want blocked non-read-only draft", draft.Validation)
+	}
+	if !containsString(draft.Validation.Errors, "management command") {
+		t.Fatalf("validation errors = %#v; want management-command error", draft.Validation.Errors)
+	}
+	if draft.ModelSafety == nil || !draft.ModelSafety.Advisory || draft.ModelSafety.Classification != "safe" {
+		t.Fatalf("model safety = %#v; want advisory safe classification preserved", draft.ModelSafety)
+	}
+	if !strings.Contains(draft.Execution.Reason, "blocked") {
+		t.Fatalf("execution reason = %q; want validation block", draft.Execution.Reason)
+	}
+}
+
+func TestAskBlocksObviousWriteCapableDraft(t *testing.T) {
+	draft := runAskWithDraft(t, queryDraft{Query: "StormEvents | take 10 | into table SavedStormEvents"})
+	if draft.Validation.Status != "failed" {
+		t.Fatalf("validation status = %q; want failed", draft.Validation.Status)
+	}
+	if draft.Validation.ReadOnly || draft.Validation.SafeForExecution {
+		t.Fatalf("validation = %#v; want unsafe draft blocked", draft.Validation)
+	}
+	if !containsString(draft.Validation.Errors, "write-capable or destructive") {
+		t.Fatalf("validation errors = %#v; want destructive-shape error", draft.Validation.Errors)
+	}
+}
+
+func TestAskBlocksUnsafeMultiStatementDraft(t *testing.T) {
+	draft := runAskWithDraft(t, queryDraft{Query: "StormEvents | take 5; StormEvents | count"})
+	if draft.Validation.Status != "failed" {
+		t.Fatalf("validation status = %q; want failed", draft.Validation.Status)
+	}
+	if !containsString(draft.Validation.Errors, "multiple executable KQL statements") {
+		t.Fatalf("validation errors = %#v; want unsafe multi-statement error", draft.Validation.Errors)
+	}
+}
+
+func TestAskAllowsBoundedLetStatementDraft(t *testing.T) {
+	draft := runAskWithDraft(t, queryDraft{
+		Query:       "let min_time = ago(1d); StormEvents | where StartTime > min_time | take 5",
+		Assumptions: []string{"Using StormEvents because it is the closest matching table in Schema Context."},
+	})
+	if draft.Validation.Status != "passed" || !draft.Validation.ReadOnly || !draft.Validation.SafeForExecution || !draft.Validation.Bounded {
+		t.Fatalf("validation = %#v; want passed bounded read-only draft", draft.Validation)
+	}
+	if len(draft.Assumptions) == 0 {
+		t.Fatal("non-blocking ambiguity assumption was not preserved")
+	}
+}
+
+func TestAskWarnsAndBlocksUnboundedExploratoryDraft(t *testing.T) {
+	draft := runAskWithDraft(t, queryDraft{Query: "StormEvents | where State == 'WA'"})
+	if draft.Validation.Status != "warning" {
+		t.Fatalf("validation status = %q; want warning", draft.Validation.Status)
+	}
+	if !draft.Validation.ReadOnly || draft.Validation.SafeForExecution || draft.Validation.Bounded {
+		t.Fatalf("validation = %#v; want read-only but not executable unbounded draft", draft.Validation)
+	}
+	if !containsString(draft.Validation.Warnings, "explicit result bound") {
+		t.Fatalf("validation warnings = %#v; want boundedness warning", draft.Validation.Warnings)
+	}
+	if !strings.Contains(draft.Execution.Reason, "validation warnings") {
+		t.Fatalf("execution reason = %q; want warning block", draft.Execution.Reason)
+	}
+}
+
+func TestAskCanReturnClarificationRequiredDraft(t *testing.T) {
+	draft := runAskWithDraft(t, queryDraft{
+		ClarificationRequired: true,
+		ClarificationQuestion: "Which public sample table should be used?",
+		Warnings:              []string{"The request could match more than one table."},
+	})
+	if !draft.ClarificationRequired {
+		t.Fatal("clarification_required was not returned")
+	}
+	if draft.ClarificationQuestion == "" {
+		t.Fatal("clarification question was not returned")
+	}
+	if draft.Query != "" {
+		t.Fatalf("query = %q; want empty query for clarification-required response", draft.Query)
+	}
+	if draft.Validation.Status != "clarification_required" || draft.Validation.SafeForExecution {
+		t.Fatalf("validation = %#v; want clarification-required block", draft.Validation)
 	}
 }
 
@@ -501,7 +668,7 @@ func TestAskOpenAICompatibleModelProviderProducesQueryDraft(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		content := `{"query":"StormEvents | take 5","assumptions":["Using the public sample StormEvents table."],"warnings":["Review before execution."],"model_safety":{"classification":"safe","reason":"Read-only query draft."}}`
+		content := `{"query":"StormEvents | take 5","clarification_required":false,"clarification_question":"","assumptions":["Using the public sample StormEvents table."],"warnings":["Review before execution."],"model_safety":{"classification":"safe","reason":"Read-only query draft."}}`
 		if err := json.NewEncoder(w).Encode(map[string]any{
 			"choices": []any{map[string]any{"message": map[string]any{"content": content}}},
 		}); err != nil {

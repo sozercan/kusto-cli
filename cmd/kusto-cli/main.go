@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -149,17 +150,19 @@ type queryDraftRequest struct {
 }
 
 type queryDraft struct {
-	Format         string                    `json:"format"`
-	Target         queryDraftTarget          `json:"target"`
-	Prompt         string                    `json:"prompt"`
-	Query          string                    `json:"query"`
-	Assumptions    []string                  `json:"assumptions"`
-	Warnings       []string                  `json:"warnings"`
-	SchemaContext  []queryDraftSchemaContext `json:"schema_context"`
-	DataDisclosure queryDraftDataDisclosure  `json:"data_disclosure_policy"`
-	Validation     queryDraftValidation      `json:"validation"`
-	Execution      queryDraftExecution       `json:"execution"`
-	ModelSafety    *queryDraftModelSafety    `json:"model_safety,omitempty"`
+	Format                string                    `json:"format"`
+	Target                queryDraftTarget          `json:"target"`
+	Prompt                string                    `json:"prompt"`
+	Query                 string                    `json:"query"`
+	ClarificationRequired bool                      `json:"clarification_required,omitempty"`
+	ClarificationQuestion string                    `json:"clarification_question,omitempty"`
+	Assumptions           []string                  `json:"assumptions"`
+	Warnings              []string                  `json:"warnings"`
+	SchemaContext         []queryDraftSchemaContext `json:"schema_context"`
+	DataDisclosure        queryDraftDataDisclosure  `json:"data_disclosure_policy"`
+	Validation            queryDraftValidation      `json:"validation"`
+	Execution             queryDraftExecution       `json:"execution"`
+	ModelSafety           *queryDraftModelSafety    `json:"model_safety,omitempty"`
 }
 
 type queryDraftModelSafety struct {
@@ -212,16 +215,20 @@ type queryDraftDataDisclosureSent struct {
 }
 
 type queryDraftValidation struct {
-	Status   string                      `json:"status"`
-	ReadOnly bool                        `json:"read_only"`
-	Checks   []queryDraftValidationCheck `json:"checks"`
-	Errors   []string                    `json:"errors"`
+	Status           string                      `json:"status"`
+	ReadOnly         bool                        `json:"read_only"`
+	Bounded          bool                        `json:"bounded"`
+	SafeForExecution bool                        `json:"safe_for_execution"`
+	Checks           []queryDraftValidationCheck `json:"checks"`
+	Warnings         []string                    `json:"warnings"`
+	Errors           []string                    `json:"errors"`
 }
 
 type queryDraftValidationCheck struct {
-	Name    string `json:"name"`
-	Passed  bool   `json:"passed"`
-	Message string `json:"message,omitempty"`
+	Name     string `json:"name"`
+	Passed   bool   `json:"passed"`
+	Severity string `json:"severity,omitempty"`
+	Message  string `json:"message,omitempty"`
 }
 
 type queryDraftExecution struct {
@@ -716,16 +723,23 @@ func normalizeQueryDraft(draft *queryDraft, req queryDraftRequest) {
 	if draft.DataDisclosure.Mode == "" {
 		draft.DataDisclosure = buildDataDisclosureReport(false, queryDraftSchemaContext{})
 	}
+	draft.ClarificationQuestion = strings.TrimSpace(draft.ClarificationQuestion)
 	if draft.ModelSafety != nil && (draft.ModelSafety.Classification != "" || draft.ModelSafety.Reason != "") {
 		draft.ModelSafety.Advisory = true
 	}
-	draft.Validation = validateQueryDraftShape(draft.Query)
-	if draft.Validation.Status != "passed" {
-		draft.Warnings = append(draft.Warnings, "Generated query failed basic validation; do not execute it until corrected.")
+	draft.Validation = validateQueryDraftSafety(*draft)
+	switch draft.Validation.Status {
+	case "passed":
+	case "clarification_required":
+		draft.Warnings = append(draft.Warnings, "Clarification is required before executable KQL can be generated.")
+	case "warning":
+		draft.Warnings = append(draft.Warnings, "Generated query has validation warnings that block execution until resolved.")
+	default:
+		draft.Warnings = append(draft.Warnings, "Generated query failed safety validation; do not execute it until corrected.")
 	}
 	draft.Execution.Executed = false
 	if draft.Execution.Reason == "" {
-		draft.Execution.Reason = "generate-only; execution requires an explicit execution gate"
+		draft.Execution.Reason = queryDraftExecutionReason(draft.Validation)
 	}
 }
 
@@ -1256,26 +1270,416 @@ func unquoteKQLIdentifier(name string) string {
 	return strings.TrimSpace(name)
 }
 
+var (
+	queryDraftResultBoundPattern  = regexp.MustCompile(`(?i)(^|\|)\s*(take|limit|top|sample)\s+\d+\b`)
+	queryDraftReducingPattern     = regexp.MustCompile(`(?i)(^|\|)\s*(count|summarize|make-series)\b`)
+	queryDraftLeadingProsePattern = regexp.MustCompile(`(?i)^\s*(here\s+is\b|here's\b|sure\b[,.]?|the\s+query\s+is\b|you\s+can\s+use\b|kql\s*:)`)
+	queryDraftWritePatterns       = []struct {
+		name string
+		re   *regexp.Regexp
+	}{
+		{name: "ingest", re: regexp.MustCompile(`(?i)\bingest(?:ion)?\b`)},
+		{name: "into_table", re: regexp.MustCompile(`(?i)\binto\s+(table|database|cluster)\b`)},
+		{name: "set_or_append_replace", re: regexp.MustCompile(`(?i)\bset\s*-\s*or\s*-\s*(append|replace)\b`)},
+		{name: "delete", re: regexp.MustCompile(`(?i)\bdelete\s+(from|table|database|records?)\b`)},
+		{name: "drop", re: regexp.MustCompile(`(?i)\bdrop\s+(table|database|column|function|materialized\s+view|external\s+table)\b`)},
+		{name: "purge", re: regexp.MustCompile(`(?i)\bpurge\s+(table|database|records?|data)\b`)},
+		{name: "alter", re: regexp.MustCompile(`(?i)\balter\s+(table|database|column|function|materialized\s+view|external\s+table)\b`)},
+		{name: "create", re: regexp.MustCompile(`(?i)\bcreate(?:\s*-\s*or\s*-\s*alter|\s*-\s*merge)?\s+(table|database|function|materialized\s+view|external\s+table)\b`)},
+		{name: "rename", re: regexp.MustCompile(`(?i)\brename\s+(table|database|column|function)\b`)},
+		{name: "move_extents", re: regexp.MustCompile(`(?i)\bmove\s+extents?\b`)},
+		{name: "truncate", re: regexp.MustCompile(`(?i)\btruncate\s+(table|database)\b`)},
+	}
+)
+
+type queryDraftKQLAnalysis struct {
+	statements              []string
+	managementCommand       bool
+	writeCapableDestructive bool
+	safeStatementShape      bool
+	statementShapeMessage   string
+	bounded                 bool
+	resultBoundMessage      string
+	rawKQLOnly              bool
+	rawKQLMessage           string
+}
+
 func validateQueryDraftShape(query string) queryDraftValidation {
-	trimmed := strings.TrimSpace(query)
-	checks := []queryDraftValidationCheck{
-		{Name: "query_not_empty", Passed: trimmed != ""},
-		{Name: "not_management_command", Passed: !strings.HasPrefix(firstStatement(query), ".")},
+	return validateQueryDraftSafety(queryDraft{Query: query})
+}
+
+func validateQueryDraftSafety(draft queryDraft) queryDraftValidation {
+	if draft.ClarificationRequired {
+		message := "clarification required before generating executable KQL"
+		if draft.ClarificationQuestion != "" {
+			message += ": " + draft.ClarificationQuestion
+		}
+		check := queryDraftValidationCheck{Name: "clarification_required", Passed: false, Severity: "error", Message: message}
+		return queryDraftValidation{
+			Status:           "clarification_required",
+			ReadOnly:         false,
+			Bounded:          false,
+			SafeForExecution: false,
+			Checks:           []queryDraftValidationCheck{check},
+			Warnings:         []string{},
+			Errors:           []string{message},
+		}
 	}
+
+	query := strings.TrimSpace(draft.Query)
+	analysis := analyzeQueryDraftKQL(query)
+	checks := []queryDraftValidationCheck{}
 	errs := []string{}
-	if !checks[0].Passed {
-		checks[0].Message = "query is required"
-		errs = append(errs, checks[0].Message)
+	warnings := []string{}
+	addCheck := func(name string, passed bool, severity, message string) {
+		check := queryDraftValidationCheck{Name: name, Passed: passed}
+		if !passed {
+			check.Severity = severity
+			check.Message = message
+			switch severity {
+			case "warning":
+				warnings = append(warnings, message)
+			default:
+				errs = append(errs, message)
+			}
+		}
+		checks = append(checks, check)
 	}
-	if !checks[1].Passed {
-		checks[1].Message = "generated query must not be a management command"
-		errs = append(errs, checks[1].Message)
-	}
+
+	addCheck("query_not_empty", query != "", "error", "query is required")
+	addCheck("raw_kql_only", analysis.rawKQLOnly, "error", analysis.rawKQLMessage)
+	addCheck("no_management_commands", !analysis.managementCommand, "error", "generated query must not be a management command")
+	addCheck("no_write_capable_or_destructive_output", !analysis.writeCapableDestructive, "error", "generated query contains obvious write-capable or destructive KQL shape")
+	addCheck("safe_statement_shape", analysis.safeStatementShape, "error", analysis.statementShapeMessage)
+	addCheck("bounded_result", analysis.bounded, "warning", analysis.resultBoundMessage)
+
+	readOnly := query != "" && analysis.rawKQLOnly && !analysis.managementCommand && !analysis.writeCapableDestructive && analysis.safeStatementShape
 	status := "passed"
 	if len(errs) > 0 {
 		status = "failed"
+	} else if len(warnings) > 0 {
+		status = "warning"
 	}
-	return queryDraftValidation{Status: status, ReadOnly: checks[0].Passed && checks[1].Passed, Checks: checks, Errors: errs}
+	return queryDraftValidation{
+		Status:           status,
+		ReadOnly:         readOnly,
+		Bounded:          analysis.bounded,
+		SafeForExecution: status == "passed" && readOnly && analysis.bounded,
+		Checks:           checks,
+		Warnings:         warnings,
+		Errors:           errs,
+	}
+}
+
+func analyzeQueryDraftKQL(query string) queryDraftKQLAnalysis {
+	trimmed := strings.TrimSpace(query)
+	rawKQLOnly, rawKQLMessage := validateRawQueryDraftKQL(trimmed)
+	analysis := queryDraftKQLAnalysis{
+		rawKQLOnly:            rawKQLOnly,
+		rawKQLMessage:         rawKQLMessage,
+		safeStatementShape:    true,
+		resultBoundMessage:    "generated query must include an explicit result bound (take, limit, top, or sample) or a reducing aggregation before it can be executed",
+		statementShapeMessage: "generated query must contain exactly one executable query statement; only let and declare query_parameters statements may precede it",
+	}
+	if trimmed == "" {
+		analysis.statements = []string{}
+		analysis.safeStatementShape = false
+		analysis.statementShapeMessage = "generated query must contain one read-only KQL query statement"
+		return analysis
+	}
+
+	statements := splitKQLStatements(trimmed)
+	analysis.statements = statements
+	analysis.managementCommand = hasManagementCommandStatement(trimmed, statements)
+	analysis.writeCapableDestructive = hasWriteCapableOrDestructiveShape(trimmed)
+	analysis.safeStatementShape, analysis.statementShapeMessage = validateQueryDraftStatementShape(statements)
+	analysis.bounded = isBoundedQueryDraft(statements)
+	return analysis
+}
+
+func validateRawQueryDraftKQL(query string) (bool, string) {
+	if strings.Contains(query, "```") {
+		return false, "generated query must be raw KQL, not a markdown code fence"
+	}
+	if queryDraftLeadingProsePattern.MatchString(query) {
+		return false, "generated query must be raw KQL, not prose"
+	}
+	return true, ""
+}
+
+func queryDraftExecutionReason(validation queryDraftValidation) string {
+	switch validation.Status {
+	case "passed":
+		return "generate-only; execution requires an explicit execution gate"
+	case "clarification_required":
+		return "blocked: clarification required before executable KQL can be generated"
+	case "warning":
+		return "blocked: Query Draft validation warnings must be resolved before execution"
+	default:
+		return "blocked: Query Draft validation failed; generated KQL is not safe to execute"
+	}
+}
+
+func hasManagementCommandStatement(query string, statements []string) bool {
+	for _, line := range strings.Split(query, "\n") {
+		s := strings.TrimSpace(line)
+		if s == "" || strings.HasPrefix(s, "//") || strings.HasPrefix(s, "#") {
+			continue
+		}
+		if strings.HasPrefix(s, ".") {
+			return true
+		}
+	}
+	for _, stmt := range statements {
+		if strings.HasPrefix(firstKQLContentLine(stmt), ".") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasWriteCapableOrDestructiveShape(query string) bool {
+	sanitized := stripKQLCommentsAndStrings(query)
+	for _, pattern := range queryDraftWritePatterns {
+		if pattern.re.MatchString(sanitized) {
+			return true
+		}
+	}
+	return false
+}
+
+func validateQueryDraftStatementShape(statements []string) (bool, string) {
+	if len(statements) == 0 {
+		return false, "generated query must contain one read-only KQL query statement"
+	}
+	executableStatements := 0
+	for i, stmt := range statements {
+		head := strings.ToLower(firstKQLContentLine(stripKQLCommentsAndStrings(stmt)))
+		if head == "" {
+			continue
+		}
+		if strings.HasPrefix(head, "set ") {
+			return false, "generated query must not include set statements; request options are controlled by the CLI"
+		}
+		if isAllowedQueryDraftDeclaration(head) {
+			if i == len(statements)-1 {
+				return false, "generated query must end with a read-only query expression, not only declarations"
+			}
+			continue
+		}
+		executableStatements++
+		if i != len(statements)-1 {
+			return false, "multiple executable KQL statements are not allowed; use let declarations followed by one query"
+		}
+	}
+	if executableStatements != 1 {
+		return false, "generated query must contain exactly one executable query statement"
+	}
+	return true, ""
+}
+
+func isAllowedQueryDraftDeclaration(head string) bool {
+	head = strings.TrimSpace(strings.ToLower(head))
+	return strings.HasPrefix(head, "let ") || strings.HasPrefix(head, "declare query_parameters")
+}
+
+func isBoundedQueryDraft(statements []string) bool {
+	stmt := finalExecutableQueryStatement(statements)
+	if strings.TrimSpace(stmt) == "" {
+		return false
+	}
+	sanitized := stripKQLCommentsAndStrings(stmt)
+	return queryDraftResultBoundPattern.MatchString(sanitized) || queryDraftReducingPattern.MatchString(sanitized)
+}
+
+func finalExecutableQueryStatement(statements []string) string {
+	for i := len(statements) - 1; i >= 0; i-- {
+		head := strings.ToLower(firstKQLContentLine(stripKQLCommentsAndStrings(statements[i])))
+		if head == "" || isAllowedQueryDraftDeclaration(head) || strings.HasPrefix(head, "set ") {
+			continue
+		}
+		return statements[i]
+	}
+	return ""
+}
+
+func firstKQLContentLine(text string) string {
+	for _, line := range strings.Split(text, "\n") {
+		s := strings.TrimSpace(line)
+		if s == "" || strings.HasPrefix(s, "//") || strings.HasPrefix(s, "#") {
+			continue
+		}
+		return s
+	}
+	return ""
+}
+
+func splitKQLStatements(text string) []string {
+	statements := []string{}
+	var b strings.Builder
+	inSingle := false
+	inDouble := false
+	inLineComment := false
+	inBlockComment := false
+	runes := []rune(text)
+	for i := 0; i < len(runes); i++ {
+		ch := runes[i]
+		next := rune(0)
+		if i+1 < len(runes) {
+			next = runes[i+1]
+		}
+		if inLineComment {
+			b.WriteRune(ch)
+			if ch == '\n' {
+				inLineComment = false
+			}
+			continue
+		}
+		if inBlockComment {
+			b.WriteRune(ch)
+			if ch == '*' && next == '/' {
+				b.WriteRune(next)
+				i++
+				inBlockComment = false
+			}
+			continue
+		}
+		if inSingle {
+			b.WriteRune(ch)
+			if ch == '\'' {
+				if next == '\'' {
+					b.WriteRune(next)
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			b.WriteRune(ch)
+			if ch == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if ch == '/' && next == '/' {
+			b.WriteRune(ch)
+			b.WriteRune(next)
+			i++
+			inLineComment = true
+			continue
+		}
+		if ch == '/' && next == '*' {
+			b.WriteRune(ch)
+			b.WriteRune(next)
+			i++
+			inBlockComment = true
+			continue
+		}
+		if ch == '\'' {
+			inSingle = true
+			b.WriteRune(ch)
+			continue
+		}
+		if ch == '"' {
+			inDouble = true
+			b.WriteRune(ch)
+			continue
+		}
+		if ch == ';' {
+			if stmt := strings.TrimSpace(b.String()); stmt != "" {
+				statements = append(statements, stmt)
+			}
+			b.Reset()
+			continue
+		}
+		b.WriteRune(ch)
+	}
+	if stmt := strings.TrimSpace(b.String()); stmt != "" {
+		statements = append(statements, stmt)
+	}
+	return statements
+}
+
+func stripKQLCommentsAndStrings(text string) string {
+	var b strings.Builder
+	inSingle := false
+	inDouble := false
+	inLineComment := false
+	inBlockComment := false
+	runes := []rune(text)
+	for i := 0; i < len(runes); i++ {
+		ch := runes[i]
+		next := rune(0)
+		if i+1 < len(runes) {
+			next = runes[i+1]
+		}
+		if inLineComment {
+			if ch == '\n' {
+				inLineComment = false
+				b.WriteRune('\n')
+			} else {
+				b.WriteRune(' ')
+			}
+			continue
+		}
+		if inBlockComment {
+			if ch == '*' && next == '/' {
+				b.WriteString("  ")
+				i++
+				inBlockComment = false
+			} else if ch == '\n' {
+				b.WriteRune('\n')
+			} else {
+				b.WriteRune(' ')
+			}
+			continue
+		}
+		if inSingle {
+			if ch == '\'' {
+				if next == '\'' {
+					b.WriteString("  ")
+					i++
+					continue
+				}
+				inSingle = false
+			}
+			b.WriteRune(' ')
+			continue
+		}
+		if inDouble {
+			if ch == '"' {
+				inDouble = false
+			}
+			b.WriteRune(' ')
+			continue
+		}
+		if ch == '/' && next == '/' {
+			b.WriteString("  ")
+			i++
+			inLineComment = true
+			continue
+		}
+		if ch == '/' && next == '*' {
+			b.WriteString("  ")
+			i++
+			inBlockComment = true
+			continue
+		}
+		if ch == '\'' {
+			inSingle = true
+			b.WriteRune(' ')
+			continue
+		}
+		if ch == '"' {
+			inDouble = true
+			b.WriteRune(' ')
+			continue
+		}
+		b.WriteRune(ch)
+	}
+	return b.String()
 }
 
 func (s *server) output() io.Writer {
@@ -1509,6 +1913,9 @@ func writeQueryDraft(w io.Writer, format string, draft queryDraft) error {
 	case "table":
 		fmt.Fprintf(w, "Target: %s / %s\n", draft.Target.ClusterURI, draft.Target.Database)
 		fmt.Fprintf(w, "Prompt: %s\n\n", draft.Prompt)
+		if draft.ClarificationRequired {
+			fmt.Fprintf(w, "Clarification Required: %s\n\n", draft.ClarificationQuestion)
+		}
 		fmt.Fprintf(w, "Query:\n%s\n\n", draft.Query)
 		writeBullets(w, "Assumptions", draft.Assumptions)
 		writeBullets(w, "Warnings", draft.Warnings)
@@ -1520,11 +1927,14 @@ func writeQueryDraft(w io.Writer, format string, draft queryDraft) error {
 				fmt.Fprintf(w, "Model Safety Reason: %s\n", draft.ModelSafety.Reason)
 			}
 		}
-		fmt.Fprintf(w, "Validation: %s (read_only=%t)\n", draft.Validation.Status, draft.Validation.ReadOnly)
+		fmt.Fprintf(w, "Validation: %s (read_only=%t bounded=%t safe_for_execution=%t)\n", draft.Validation.Status, draft.Validation.ReadOnly, draft.Validation.Bounded, draft.Validation.SafeForExecution)
 		for _, check := range draft.Validation.Checks {
 			status := "failed"
 			if check.Passed {
 				status = "passed"
+			}
+			if check.Severity != "" {
+				status += "/" + check.Severity
 			}
 			if check.Message == "" {
 				fmt.Fprintf(w, "- %s: %s\n", check.Name, status)
@@ -1540,6 +1950,10 @@ func writeQueryDraft(w io.Writer, format string, draft queryDraft) error {
 		fmt.Fprintf(w, "target.database\t%s\n", oneLine(draft.Target.Database))
 		fmt.Fprintf(w, "prompt\t%s\n", oneLine(draft.Prompt))
 		fmt.Fprintf(w, "query\t%s\n", oneLine(draft.Query))
+		if draft.ClarificationRequired {
+			fmt.Fprintf(w, "clarification_required\t%t\n", draft.ClarificationRequired)
+			fmt.Fprintf(w, "clarification_question\t%s\n", oneLine(draft.ClarificationQuestion))
+		}
 		fmt.Fprintf(w, "assumptions\t%s\n", oneLine(strings.Join(draft.Assumptions, "; ")))
 		fmt.Fprintf(w, "warnings\t%s\n", oneLine(strings.Join(draft.Warnings, "; ")))
 		fmt.Fprintf(w, "data_disclosure_policy.mode\t%s\n", oneLine(draft.DataDisclosure.Mode))
@@ -1555,6 +1969,10 @@ func writeQueryDraft(w io.Writer, format string, draft queryDraft) error {
 		}
 		fmt.Fprintf(w, "validation.status\t%s\n", oneLine(draft.Validation.Status))
 		fmt.Fprintf(w, "validation.read_only\t%t\n", draft.Validation.ReadOnly)
+		fmt.Fprintf(w, "validation.bounded\t%t\n", draft.Validation.Bounded)
+		fmt.Fprintf(w, "validation.safe_for_execution\t%t\n", draft.Validation.SafeForExecution)
+		fmt.Fprintf(w, "validation.warnings\t%s\n", oneLine(strings.Join(draft.Validation.Warnings, "; ")))
+		fmt.Fprintf(w, "validation.errors\t%s\n", oneLine(strings.Join(draft.Validation.Errors, "; ")))
 		fmt.Fprintf(w, "execution.executed\t%t\n", draft.Execution.Executed)
 		fmt.Fprintf(w, "execution.reason\t%s\n", oneLine(draft.Execution.Reason))
 		return nil
