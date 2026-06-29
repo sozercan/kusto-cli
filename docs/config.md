@@ -47,7 +47,7 @@ A catalog entry may use `alias` or `name` as its stable selector. Existing `serv
 
 ## Model provider configuration for `ask`
 
-`ask` uses the deterministic fake model provider unless a real provider is explicitly configured. To use an OpenAI-compatible chat completions endpoint, configure the provider, endpoint, model name, and the name of an environment variable that contains the API key:
+See [Model providers](providers.md) for the complete provider guide. `ask` uses the deterministic fake model provider unless a real provider is explicitly configured. To use an OpenAI-compatible chat completions endpoint, configure the provider, endpoint, model name, and the name of an environment variable that contains the API key:
 
 ```bash
 export OPENAI_API_KEY="..."
@@ -57,7 +57,7 @@ kusto-cli config set model test-model
 kusto-cli config set model-api-key-env OPENAI_API_KEY
 ```
 
-The config stores only the environment variable name, not the API key value. API keys are sent as bearer credentials to the model provider and are not included in normal `ask` output. Model safety classifications in provider output are advisory; `kusto-cli` still applies its own Query Draft validation and execution remains gated.
+The config stores only the environment variable name, not the API key value. Do not store secrets in `model-api-key-env` or commit shell history containing secret values. API keys are sent as bearer credentials to the model provider and are not included in normal `ask` output. Model safety classifications in provider output are advisory; `kusto-cli` still applies its own Query Draft validation and execution remains gated.
 
 ## Query Draft examples and configured shots
 

@@ -143,13 +143,16 @@ kusto-cli --service-uri https://help.kusto.windows.net --database Samples -o tab
 
 ## Documentation
 
+- [Ask Query Drafts](docs/ask.md)
 - [Agent guide](docs/agent-guide.md)
 - [Authentication](docs/auth.md)
 - [Configuration](docs/config.md)
+- [Model providers](docs/providers.md)
 - [Safety](docs/safety.md)
 - [Release](docs/release.md)
 - [Protocol behavior](docs/protocol.md)
 - [Architecture](docs/architecture.md)
+- [Public ask examples](examples/ask/README.md)
 
 ## Development
 
@@ -158,6 +161,8 @@ make test-short
 make vet
 make build-static
 ```
+
+Offline Query Draft eval fixtures live in [evals/ask](evals/ask/README.md) and run as part of `go test ./...`.
 
 ## License
 

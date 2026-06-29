@@ -24,3 +24,20 @@ The current implementation is intentionally small and standard-library only:
 - No interactive prompts.
 - Bearer tokens are never printed.
 - Direct `query`, `command`, `tools`, and `call` modes make validation and agent scripting straightforward.
+
+## Query Draft Agent architecture
+
+`ask` follows a generate-first pipeline:
+
+```text
+Target resolution
+  └─ Schema Context discovery
+      └─ examples/shots selection
+          └─ model-provider adapter (fake by default)
+              └─ Query Draft normalization
+                  └─ CLI-owned validation
+                      └─ optional query-plan validation / Repair Passes
+                          └─ optional Execution Gate (`--execute`)
+```
+
+Target resolution happens before schema discovery or model-provider calls. The model-provider adapter keeps provider-specific request and response formats out of command handling and allows offline evals to use fake providers. Execution remains separate from generation and uses the same read-only Kusto path as direct read queries.
