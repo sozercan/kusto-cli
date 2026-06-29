@@ -215,3 +215,151 @@ func TestFakeQueryDraftAgentEscapesPrompt(t *testing.T) {
 		t.Fatalf("query = %q", draft.Query)
 	}
 }
+
+func TestAskRejectsFallbackDatabaseAsTargetAndDoesNotCallAgent(t *testing.T) {
+	var out bytes.Buffer
+	agent := &recordingQueryDraftAgent{}
+	s := &server{
+		cfg:             config{serviceURI: "https://help.kusto.windows.net", database: defaultKustoDB, output: "json"},
+		queryDraftAgent: agent,
+		stdout:          &out,
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	err := s.runCommand(context.Background(), []string{"ask", "show", "storm", "events"})
+	if err == nil || !strings.Contains(err.Error(), "ask requires a Target database") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if agent.called {
+		t.Fatal("Query Draft Agent was called before Target resolution failed")
+	}
+	if out.Len() != 0 {
+		t.Fatalf("failed ask wrote output: %q", out.String())
+	}
+}
+
+func TestAskSelectsTargetByAliasFromCatalog(t *testing.T) {
+	var out bytes.Buffer
+	agent := &recordingQueryDraftAgent{}
+	s := &server{
+		cfg: config{
+			knownServices: `[
+				{"alias":"samples","service_uri":"https://help.kusto.windows.net","default_database":"Samples","description":"Public sample data"},
+				{"alias":"samples-alt","service_uri":"https://help.kusto.windows.net:443","default_database":"Samples","description":"Alternate test target"}
+			]`,
+			output: "json",
+		},
+		queryDraftAgent: agent,
+		stdout:          &out,
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.runCommand(context.Background(), []string{"ask", "--target", "samples", "show", "storm", "events"}); err != nil {
+		t.Fatal(err)
+	}
+	if !agent.called {
+		t.Fatal("fake Query Draft Agent was not called")
+	}
+	if agent.req.Target.ClusterURI != "https://help.kusto.windows.net" || agent.req.Target.Database != "Samples" {
+		t.Fatalf("target = %#v; want samples alias target", agent.req.Target)
+	}
+	var draft queryDraft
+	if err := json.Unmarshal(out.Bytes(), &draft); err != nil {
+		t.Fatal(err)
+	}
+	if draft.Target.ClusterURI != "https://help.kusto.windows.net" || draft.Target.Database != "Samples" {
+		t.Fatalf("output target = %#v; want resolved samples target", draft.Target)
+	}
+}
+
+func TestAskMultipleTargetsWithoutSelectionFailsAndDoesNotInferFromPrompt(t *testing.T) {
+	var out bytes.Buffer
+	agent := &recordingQueryDraftAgent{}
+	s := &server{
+		cfg: config{
+			knownServices: `[
+				{"alias":"samples","service_uri":"https://help.kusto.windows.net","default_database":"Samples"},
+				{"alias":"samples-alt","service_uri":"https://help.kusto.windows.net:443","default_database":"Samples"}
+			]`,
+			output: "json",
+		},
+		queryDraftAgent: agent,
+		stdout:          &out,
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	err := s.runCommand(context.Background(), []string{"ask", "use", "the", "samples", "target"})
+	if err == nil {
+		t.Fatal("expected multiple Target Catalog entries to require explicit selection")
+	}
+	for _, want := range []string{"multiple targets are configured", "samples:", "samples-alt:"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not contain %q", err.Error(), want)
+		}
+	}
+	if agent.called {
+		t.Fatal("Query Draft Agent was called despite ambiguous Target Catalog")
+	}
+	if out.Len() != 0 {
+		t.Fatalf("failed ask wrote output: %q", out.String())
+	}
+}
+
+func TestAskSupportsNameAliasAndLegacyServiceField(t *testing.T) {
+	agent := &recordingQueryDraftAgent{}
+	s := &server{
+		cfg: config{
+			knownServices: `[{"name":"samples","service":"https://help.kusto.windows.net","default_database":"Samples"}]`,
+			targetAlias:   "samples",
+			output:        "json",
+		},
+		queryDraftAgent: agent,
+		stdout:          &bytes.Buffer{},
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.runCommand(context.Background(), []string{"ask", "show", "storm", "events"}); err != nil {
+		t.Fatal(err)
+	}
+	if !agent.called {
+		t.Fatal("fake Query Draft Agent was not called")
+	}
+	if agent.req.Target.ClusterURI != "https://help.kusto.windows.net" || agent.req.Target.Database != "Samples" {
+		t.Fatalf("target = %#v; want target resolved through name/service compatibility", agent.req.Target)
+	}
+}
+
+func TestDefaultDatabaseFallbackRemainsForDirectResolution(t *testing.T) {
+	s := &server{cfg: config{database: defaultKustoDB, knownServices: `[{"service_uri":"https://help.kusto.windows.net"}]`}}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.defaultDatabaseFor("https://help.kusto.windows.net", ""); got != defaultKustoDB {
+		t.Fatalf("defaultDatabaseFor fallback = %q; want %q", got, defaultKustoDB)
+	}
+}
+
+func TestAskLocalServiceDatabaseOverridesConfiguredTargetAlias(t *testing.T) {
+	agent := &recordingQueryDraftAgent{}
+	s := &server{
+		cfg:             config{targetAlias: "missing", output: "json"},
+		queryDraftAgent: agent,
+		stdout:          &bytes.Buffer{},
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.runCommand(context.Background(), []string{"ask", "--service-uri", "https://help.kusto.windows.net", "--database", "Samples", "show", "storm", "events"}); err != nil {
+		t.Fatal(err)
+	}
+	if !agent.called {
+		t.Fatal("fake Query Draft Agent was not called")
+	}
+	if agent.req.Target.ClusterURI != "https://help.kusto.windows.net" || agent.req.Target.Database != "Samples" {
+		t.Fatalf("target = %#v; want local service/database target", agent.req.Target)
+	}
+}

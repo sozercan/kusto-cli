@@ -38,6 +38,20 @@ Run a query:
 kusto-cli --service-uri https://help.kusto.windows.net --database Samples query 'StormEvents | count'
 ```
 
+Generate a Query Draft from natural language without executing it:
+
+```bash
+kusto-cli --service-uri https://help.kusto.windows.net --database Samples ask 'show recent storm events'
+```
+
+Or select the same Target from a Target Catalog alias:
+
+```bash
+kusto-cli --known-services '[{"alias":"samples","service_uri":"https://help.kusto.windows.net","default_database":"Samples"}]' \
+  --target samples \
+  ask 'show recent storm events'
+```
+
 List databases:
 
 ```bash
@@ -79,6 +93,7 @@ kusto-cli auth status
 
 | Command | Description |
 |---------|-------------|
+| `kusto-cli ask '<natural-language prompt>'` | Generate a Query Draft without executing it |
 | `kusto-cli query '<kql>'` | Run a KQL query |
 | `kusto-cli command '.show tables'` | Run a management command |
 | `kusto-cli databases list` | List databases |

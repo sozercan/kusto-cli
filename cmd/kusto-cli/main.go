@@ -33,22 +33,26 @@ const (
 )
 
 type config struct {
-	serviceURI    string
-	database      string
-	knownServices string
-	tokenEnv      string
-	authMode      string
-	tenant        string
-	userAgent     string
-	timeout       time.Duration
-	output        string
-	allowWrite    bool
-	dryRun        bool
-	noInput       bool
-	force         bool
-	debug         bool
-	printVersion  bool
-	args          []string
+	serviceURI         string
+	database           string
+	knownServices      string
+	targetAlias        string
+	databaseConfigured bool
+	serviceURIFlag     bool
+	targetAliasFlag    bool
+	tokenEnv           string
+	authMode           string
+	tenant             string
+	userAgent          string
+	timeout            time.Duration
+	output             string
+	allowWrite         bool
+	dryRun             bool
+	noInput            bool
+	force              bool
+	debug              bool
+	printVersion       bool
+	args               []string
 }
 
 type server struct {
@@ -72,10 +76,13 @@ type tokenProvider struct {
 }
 
 type KustoServiceConfig struct {
-	ServiceURI      string `json:"service_uri"`
-	Service         string `json:"service,omitempty"`
-	DefaultDatabase string `json:"default_database,omitempty"`
-	Description     string `json:"description,omitempty"`
+	Alias           string   `json:"alias,omitempty"`
+	Name            string   `json:"name,omitempty"`
+	Aliases         []string `json:"aliases,omitempty"`
+	ServiceURI      string   `json:"service_uri"`
+	Service         string   `json:"service,omitempty"`
+	DefaultDatabase string   `json:"default_database,omitempty"`
+	Description     string   `json:"description,omitempty"`
 }
 
 type rpcMessage struct {
@@ -181,10 +188,13 @@ func main() {
 
 func parseFlags() config {
 	cfg := config{}
+	targetAliasDefault := firstNonEmpty(os.Getenv("KUSTO_TARGET"), os.Getenv("KUSTO_TARGET_ALIAS"))
 	flag.StringVar(&cfg.serviceURI, "service-uri", firstNonEmpty(os.Getenv("KUSTO_SERVICE_URI"), ""), "default Kusto cluster URI")
 	flag.StringVar(&cfg.serviceURI, "service-url", firstNonEmpty(os.Getenv("KUSTO_SERVICE_URI"), ""), "alias for --service-uri")
 	flag.StringVar(&cfg.database, "database", firstNonEmpty(os.Getenv("KUSTO_SERVICE_DEFAULT_DB"), defaultKustoDB), "default database")
 	flag.StringVar(&cfg.knownServices, "known-services", os.Getenv("KUSTO_KNOWN_SERVICES"), "JSON array of known services")
+	flag.StringVar(&cfg.targetAlias, "target", targetAliasDefault, "Target Catalog alias for ask")
+	flag.StringVar(&cfg.targetAlias, "target-alias", targetAliasDefault, "alias for --target")
 	flag.StringVar(&cfg.tokenEnv, "token-env", "KUSTO_ACCESS_TOKEN", "environment variable containing a Kusto bearer token")
 	flag.StringVar(&cfg.authMode, "auth", "auto", "auth mode: auto, env, azcli, none")
 	flag.StringVar(&cfg.tenant, "tenant", "", "optional Azure tenant id for az CLI token acquisition")
@@ -200,7 +210,11 @@ func parseFlags() config {
 	flag.BoolVar(&cfg.printVersion, "version", false, "print version and exit")
 	flag.Parse()
 	cfg.args = flag.Args()
-	applyFileConfig(&cfg, visitedFlags())
+	visited := visitedFlags()
+	cfg.serviceURIFlag = visited["service-uri"] || visited["service-url"]
+	cfg.targetAliasFlag = visited["target"] || visited["target-alias"]
+	cfg.databaseConfigured = visited["database"] || os.Getenv("KUSTO_SERVICE_DEFAULT_DB") != ""
+	applyFileConfig(&cfg, visited)
 	return cfg
 }
 
@@ -224,23 +238,23 @@ func run(ctx context.Context, cfg config) error {
 }
 
 func (s *server) loadKnownServices() error {
-	seen := map[string]bool{}
 	add := func(svc KustoServiceConfig) {
 		if svc.ServiceURI == "" {
 			svc.ServiceURI = svc.Service
 		}
+		svc.Alias = strings.TrimSpace(svc.Alias)
+		svc.Name = strings.TrimSpace(svc.Name)
+		for i := range svc.Aliases {
+			svc.Aliases[i] = strings.TrimSpace(svc.Aliases[i])
+		}
 		svc.ServiceURI = strings.TrimSpace(svc.ServiceURI)
+		svc.DefaultDatabase = strings.TrimSpace(svc.DefaultDatabase)
 		if svc.ServiceURI == "" {
 			return
 		}
-		if svc.DefaultDatabase == "" {
-			svc.DefaultDatabase = s.cfg.database
+		if svc.DefaultDatabase == "" && s.cfg.hasConfiguredDatabase() {
+			svc.DefaultDatabase = strings.TrimSpace(s.cfg.database)
 		}
-		key := normalizeServiceURI(svc.ServiceURI)
-		if seen[key] {
-			return
-		}
-		seen[key] = true
 		s.knownServices = append(s.knownServices, svc)
 		if s.defaultSvc == nil {
 			copy := svc
@@ -248,7 +262,11 @@ func (s *server) loadKnownServices() error {
 		}
 	}
 	if s.cfg.serviceURI != "" {
-		add(KustoServiceConfig{ServiceURI: s.cfg.serviceURI, DefaultDatabase: s.cfg.database, Description: "Default"})
+		defaultDatabase := ""
+		if s.cfg.hasConfiguredDatabase() {
+			defaultDatabase = strings.TrimSpace(s.cfg.database)
+		}
+		add(KustoServiceConfig{ServiceURI: s.cfg.serviceURI, DefaultDatabase: defaultDatabase, Description: "Default"})
 	}
 	if strings.TrimSpace(s.cfg.knownServices) != "" {
 		var svcs []KustoServiceConfig
@@ -306,12 +324,27 @@ func (s *server) runCommand(ctx context.Context, args []string) error {
 	}
 }
 
+type askTargetSelection struct {
+	Alias         string
+	ServiceURI    string
+	Database      string
+	ServiceURISet bool
+	DatabaseSet   bool
+}
+
+type askTargetCandidate struct {
+	ClusterURI  string
+	Database    string
+	Aliases     []string
+	Description string
+}
+
 func (s *server) runAskCommand(ctx context.Context, args []string) error {
-	prompt := strings.TrimSpace(strings.Join(args, " "))
-	if prompt == "" {
-		return errors.New("usage: kusto-cli ask '<natural-language prompt>'")
+	selection, prompt, err := parseAskArgs(args)
+	if err != nil {
+		return err
 	}
-	target, err := s.queryDraftTarget()
+	target, err := s.queryDraftTarget(selection)
 	if err != nil {
 		return err
 	}
@@ -327,23 +360,207 @@ func (s *server) runAskCommand(ctx context.Context, args []string) error {
 	return writeQueryDraft(s.output(), s.cfg.output, draft)
 }
 
-func (s *server) queryDraftTarget() (queryDraftTarget, error) {
-	clusterURI := strings.TrimSpace(s.defaultClusterURI())
-	if clusterURI == "" {
-		clusterURI = strings.TrimSpace(s.cfg.serviceURI)
+func parseAskArgs(args []string) (askTargetSelection, string, error) {
+	var selection askTargetSelection
+	promptArgs := []string{}
+	for i := 0; i < len(args); {
+		arg := args[i]
+		switch {
+		case arg == "--":
+			promptArgs = append(promptArgs, args[i+1:]...)
+			i = len(args)
+		case arg == "--target" || arg == "--target-alias":
+			if i+1 >= len(args) {
+				return selection, "", fmt.Errorf("%s requires a value", arg)
+			}
+			selection.Alias = args[i+1]
+			if strings.TrimSpace(selection.Alias) == "" {
+				return selection, "", fmt.Errorf("%s requires a non-empty value", arg)
+			}
+			i += 2
+		case strings.HasPrefix(arg, "--target="):
+			selection.Alias = strings.TrimPrefix(arg, "--target=")
+			if strings.TrimSpace(selection.Alias) == "" {
+				return selection, "", errors.New("--target requires a non-empty value")
+			}
+			i++
+		case strings.HasPrefix(arg, "--target-alias="):
+			selection.Alias = strings.TrimPrefix(arg, "--target-alias=")
+			if strings.TrimSpace(selection.Alias) == "" {
+				return selection, "", errors.New("--target-alias requires a non-empty value")
+			}
+			i++
+		case arg == "--service-uri" || arg == "--service-url":
+			if i+1 >= len(args) {
+				return selection, "", fmt.Errorf("%s requires a value", arg)
+			}
+			selection.ServiceURI = args[i+1]
+			selection.ServiceURISet = true
+			i += 2
+		case strings.HasPrefix(arg, "--service-uri="):
+			selection.ServiceURI = strings.TrimPrefix(arg, "--service-uri=")
+			selection.ServiceURISet = true
+			i++
+		case strings.HasPrefix(arg, "--service-url="):
+			selection.ServiceURI = strings.TrimPrefix(arg, "--service-url=")
+			selection.ServiceURISet = true
+			i++
+		case arg == "--database":
+			if i+1 >= len(args) {
+				return selection, "", errors.New("--database requires a value")
+			}
+			selection.Database = args[i+1]
+			selection.DatabaseSet = true
+			i += 2
+		case strings.HasPrefix(arg, "--database="):
+			selection.Database = strings.TrimPrefix(arg, "--database=")
+			selection.DatabaseSet = true
+			i++
+		default:
+			promptArgs = append(promptArgs, args[i:]...)
+			i = len(args)
+		}
 	}
+	prompt := strings.TrimSpace(strings.Join(promptArgs, " "))
+	if prompt == "" {
+		return selection, "", errors.New("usage: kusto-cli ask '<natural-language prompt>'")
+	}
+	return selection, prompt, nil
+}
+
+func (s *server) queryDraftTarget(selection askTargetSelection) (queryDraftTarget, error) {
+	database, databaseSet := s.askSelectedDatabase(selection)
+	if alias := strings.TrimSpace(selection.Alias); alias != "" {
+		return s.queryDraftTargetByAlias(alias, database, databaseSet)
+	}
+	if selection.ServiceURISet {
+		return s.queryDraftTargetByServiceURI(selection.ServiceURI, database, databaseSet)
+	}
+	if strings.TrimSpace(s.cfg.targetAlias) != "" && s.cfg.targetAliasFlag {
+		return s.queryDraftTargetByAlias(s.cfg.targetAlias, database, databaseSet)
+	}
+	if s.cfg.serviceURIFlag {
+		return s.queryDraftTargetByServiceURI(s.cfg.serviceURI, database, databaseSet)
+	}
+	if clusterURI, serviceURISet := s.askSelectedServiceURI(selection); serviceURISet && databaseSet {
+		return s.queryDraftTargetByServiceURI(clusterURI, database, databaseSet)
+	}
+	if alias := strings.TrimSpace(s.cfg.targetAlias); alias != "" {
+		return s.queryDraftTargetByAlias(alias, database, databaseSet)
+	}
+	if clusterURI, serviceURISet := s.askSelectedServiceURI(selection); serviceURISet {
+		return s.queryDraftTargetByServiceURI(clusterURI, database, databaseSet)
+	}
+	return s.queryDraftTargetFromCatalog(database, databaseSet)
+}
+
+func (s *server) askSelectedServiceURI(selection askTargetSelection) (string, bool) {
+	if selection.ServiceURISet {
+		return strings.TrimSpace(selection.ServiceURI), true
+	}
+	if strings.TrimSpace(s.cfg.serviceURI) != "" {
+		return strings.TrimSpace(s.cfg.serviceURI), true
+	}
+	return "", false
+}
+
+func (s *server) askSelectedDatabase(selection askTargetSelection) (string, bool) {
+	if selection.DatabaseSet {
+		return strings.TrimSpace(selection.Database), true
+	}
+	if s.cfg.hasConfiguredDatabase() {
+		return strings.TrimSpace(s.cfg.database), true
+	}
+	return "", false
+}
+
+func (s *server) queryDraftTargetByAlias(alias, database string, databaseSet bool) (queryDraftTarget, error) {
+	var matches []queryDraftTarget
+	aliasWasConfigured := false
+	for _, svc := range s.knownServices {
+		if !svc.matchesTargetAlias(alias) {
+			continue
+		}
+		aliasWasConfigured = true
+		db := strings.TrimSpace(svc.DefaultDatabase)
+		if db == "" && databaseSet {
+			db = strings.TrimSpace(database)
+		}
+		if db == "" {
+			continue
+		}
+		matches = appendUniqueQueryDraftTarget(matches, queryDraftTarget{ClusterURI: svc.ServiceURI, Database: db})
+	}
+	switch len(matches) {
+	case 1:
+		return validateQueryDraftTarget(matches[0])
+	case 0:
+		if aliasWasConfigured {
+			return queryDraftTarget{}, fmt.Errorf("target alias %q does not resolve a database; add default_database to its Target Catalog entry or provide --database", alias)
+		}
+		if len(s.allTargetAliases()) == 0 {
+			return queryDraftTarget{}, fmt.Errorf("target alias %q was not found; no Target Catalog aliases are configured", alias)
+		}
+		return queryDraftTarget{}, fmt.Errorf("target alias %q was not found; available targets:\n%s", alias, formatAskTargets(s.askTargetCatalog()))
+	default:
+		return queryDraftTarget{}, fmt.Errorf("target alias %q is ambiguous; matching targets:\n%s", alias, formatQueryDraftTargets(matches))
+	}
+}
+
+func (s *server) queryDraftTargetByServiceURI(clusterURI, database string, databaseSet bool) (queryDraftTarget, error) {
+	clusterURI = strings.TrimSpace(clusterURI)
 	if clusterURI == "" {
-		return queryDraftTarget{}, errors.New("ask requires a target; provide --service-uri and --database")
+		return queryDraftTarget{}, errors.New("ask requires a Target service URI; provide --service-uri or select --target")
 	}
 	clusterURI = strings.TrimRight(clusterURI, "/")
 	if _, err := url.ParseRequestURI(clusterURI); err != nil {
 		return queryDraftTarget{}, fmt.Errorf("service-uri is not a valid URL: %w", err)
 	}
-	database := s.defaultDatabaseFor(clusterURI, s.cfg.database)
-	if strings.TrimSpace(database) == "" {
-		return queryDraftTarget{}, errors.New("ask requires a target database; provide --database")
+	if databaseSet {
+		if strings.TrimSpace(database) == "" {
+			return queryDraftTarget{}, errors.New("ask requires a Target database; provide --database or select --target")
+		}
+		return validateQueryDraftTarget(queryDraftTarget{ClusterURI: clusterURI, Database: database})
 	}
-	return queryDraftTarget{ClusterURI: clusterURI, Database: strings.TrimSpace(database)}, nil
+	matches := s.targetsForServiceURI(clusterURI)
+	switch len(matches) {
+	case 1:
+		return validateQueryDraftTarget(matches[0])
+	case 0:
+		return queryDraftTarget{}, errors.New("ask requires a Target database; provide --database or select --target")
+	default:
+		return queryDraftTarget{}, fmt.Errorf("service-uri matches multiple configured targets; provide --database or select --target:\n%s", formatQueryDraftTargets(matches))
+	}
+}
+
+func (s *server) queryDraftTargetFromCatalog(database string, databaseSet bool) (queryDraftTarget, error) {
+	if databaseSet {
+		if strings.TrimSpace(database) == "" {
+			return queryDraftTarget{}, errors.New("ask requires a Target database; provide --database or select --target")
+		}
+		clusters := s.configuredServiceURIs()
+		switch len(clusters) {
+		case 1:
+			return validateQueryDraftTarget(queryDraftTarget{ClusterURI: clusters[0], Database: database})
+		case 0:
+			return queryDraftTarget{}, errors.New("ask requires a Target service URI; provide --service-uri or select --target")
+		default:
+			return queryDraftTarget{}, fmt.Errorf("ask requires exactly one Target; multiple Target Catalog services are configured, select one with --target or --service-uri:\n%s", formatConfiguredServices(clusters))
+		}
+	}
+	targets := s.askTargetCatalog()
+	switch len(targets) {
+	case 1:
+		return validateQueryDraftTarget(queryDraftTarget{ClusterURI: targets[0].ClusterURI, Database: targets[0].Database})
+	case 0:
+		msg := "ask requires a Target; provide --service-uri and --database or select --target from the Target Catalog"
+		if len(s.knownServices) > 0 {
+			msg += "\nConfigured services without target databases:\n" + formatConfiguredServices(s.configuredServiceURIs())
+		}
+		return queryDraftTarget{}, errors.New(msg)
+	default:
+		return queryDraftTarget{}, fmt.Errorf("ask requires exactly one Target; multiple targets are configured, select one with --target:\n%s", formatAskTargets(targets))
+	}
 }
 
 func (fakeQueryDraftAgent) GenerateQueryDraft(_ context.Context, req queryDraftRequest) (queryDraft, error) {
@@ -588,6 +805,7 @@ func (s *server) runAPICommand(ctx context.Context, args []string) error {
 func printKustoUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
   kusto-cli --service-uri <cluster> --database <db> ask '<natural-language prompt>'
+  kusto-cli --target <alias> ask '<natural-language prompt>'
   kusto-cli --service-uri <cluster> --database <db> query '<kql>'
   kusto-cli databases list
   kusto-cli tables list
@@ -865,9 +1083,15 @@ func applyFileConfig(cfg *config, visited map[string]bool) {
 	}
 	if !visited["database"] && os.Getenv("KUSTO_SERVICE_DEFAULT_DB") == "" && fileCfg["database"] != "" {
 		cfg.database = fileCfg["database"]
+		cfg.databaseConfigured = true
 	}
 	if !visited["known-services"] && os.Getenv("KUSTO_KNOWN_SERVICES") == "" && fileCfg["known-services"] != "" {
 		cfg.knownServices = fileCfg["known-services"]
+	}
+	if !visited["target"] && !visited["target-alias"] && os.Getenv("KUSTO_TARGET") == "" && os.Getenv("KUSTO_TARGET_ALIAS") == "" {
+		if target := firstNonEmpty(fileCfg["target"], fileCfg["target-alias"]); target != "" {
+			cfg.targetAlias = target
+		}
 	}
 	if !visited["tenant"] && fileCfg["tenant"] != "" {
 		cfg.tenant = fileCfg["tenant"]
@@ -1687,6 +1911,189 @@ func rowsToDicts(resp kustoResponse) []map[string]any {
 	}
 	return out
 }
+func (cfg config) hasConfiguredDatabase() bool {
+	if cfg.databaseConfigured {
+		return true
+	}
+	database := strings.TrimSpace(cfg.database)
+	return database != "" && database != defaultKustoDB
+}
+
+func (svc KustoServiceConfig) targetAliases() []string {
+	aliases := []string{}
+	aliases = appendUniqueString(aliases, strings.TrimSpace(svc.Alias))
+	aliases = appendUniqueString(aliases, strings.TrimSpace(svc.Name))
+	for _, alias := range svc.Aliases {
+		aliases = appendUniqueString(aliases, strings.TrimSpace(alias))
+	}
+	return aliases
+}
+
+func (svc KustoServiceConfig) matchesTargetAlias(alias string) bool {
+	alias = strings.TrimSpace(alias)
+	for _, candidate := range svc.targetAliases() {
+		if candidate == alias {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *server) askTargetCatalog() []askTargetCandidate {
+	targets := []askTargetCandidate{}
+	indexes := map[string]int{}
+	for _, svc := range s.knownServices {
+		clusterURI := strings.TrimRight(strings.TrimSpace(svc.ServiceURI), "/")
+		database := strings.TrimSpace(svc.DefaultDatabase)
+		if clusterURI == "" || database == "" {
+			continue
+		}
+		key := targetKey(clusterURI, database)
+		if idx, ok := indexes[key]; ok {
+			for _, alias := range svc.targetAliases() {
+				targets[idx].Aliases = appendUniqueString(targets[idx].Aliases, alias)
+			}
+			if targets[idx].Description == "" {
+				targets[idx].Description = strings.TrimSpace(svc.Description)
+			}
+			continue
+		}
+		indexes[key] = len(targets)
+		targets = append(targets, askTargetCandidate{
+			ClusterURI:  clusterURI,
+			Database:    database,
+			Aliases:     svc.targetAliases(),
+			Description: strings.TrimSpace(svc.Description),
+		})
+	}
+	return targets
+}
+
+func (s *server) targetsForServiceURI(clusterURI string) []queryDraftTarget {
+	clusterURI = strings.TrimRight(strings.TrimSpace(clusterURI), "/")
+	matches := []queryDraftTarget{}
+	for _, target := range s.askTargetCatalog() {
+		if normalizeServiceURI(target.ClusterURI) == normalizeServiceURI(clusterURI) {
+			matches = appendUniqueQueryDraftTarget(matches, queryDraftTarget{ClusterURI: target.ClusterURI, Database: target.Database})
+		}
+	}
+	return matches
+}
+
+func (s *server) configuredServiceURIs() []string {
+	services := []string{}
+	for _, svc := range s.knownServices {
+		clusterURI := strings.TrimRight(strings.TrimSpace(svc.ServiceURI), "/")
+		if clusterURI == "" {
+			continue
+		}
+		if !containsNormalizedServiceURI(services, clusterURI) {
+			services = append(services, clusterURI)
+		}
+	}
+	return services
+}
+
+func (s *server) allTargetAliases() []string {
+	aliases := []string{}
+	for _, svc := range s.knownServices {
+		for _, alias := range svc.targetAliases() {
+			aliases = appendUniqueString(aliases, alias)
+		}
+	}
+	return aliases
+}
+
+func validateQueryDraftTarget(target queryDraftTarget) (queryDraftTarget, error) {
+	target.ClusterURI = strings.TrimRight(strings.TrimSpace(target.ClusterURI), "/")
+	target.Database = strings.TrimSpace(target.Database)
+	if target.ClusterURI == "" {
+		return queryDraftTarget{}, errors.New("ask requires a Target service URI; provide --service-uri or select --target")
+	}
+	if _, err := url.ParseRequestURI(target.ClusterURI); err != nil {
+		return queryDraftTarget{}, fmt.Errorf("service-uri is not a valid URL: %w", err)
+	}
+	if target.Database == "" {
+		return queryDraftTarget{}, errors.New("ask requires a Target database; provide --database or select --target")
+	}
+	return target, nil
+}
+
+func appendUniqueQueryDraftTarget(targets []queryDraftTarget, target queryDraftTarget) []queryDraftTarget {
+	key := targetKey(target.ClusterURI, target.Database)
+	for _, existing := range targets {
+		if targetKey(existing.ClusterURI, existing.Database) == key {
+			return targets
+		}
+	}
+	return append(targets, target)
+}
+
+func appendUniqueString(values []string, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return values
+	}
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func containsNormalizedServiceURI(values []string, value string) bool {
+	needle := normalizeServiceURI(value)
+	for _, existing := range values {
+		if normalizeServiceURI(existing) == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func targetKey(clusterURI, database string) string {
+	return normalizeServiceURI(clusterURI) + "\x00" + strings.TrimSpace(database)
+}
+
+func formatAskTargets(targets []askTargetCandidate) string {
+	if len(targets) == 0 {
+		return "  - (none)"
+	}
+	lines := make([]string, 0, len(targets))
+	for _, target := range targets {
+		label := strings.Join(target.Aliases, ", ")
+		if label == "" {
+			lines = append(lines, fmt.Sprintf("  - %s / %s", target.ClusterURI, target.Database))
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("  - %s: %s / %s", label, target.ClusterURI, target.Database))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func formatQueryDraftTargets(targets []queryDraftTarget) string {
+	if len(targets) == 0 {
+		return "  - (none)"
+	}
+	lines := make([]string, 0, len(targets))
+	for _, target := range targets {
+		lines = append(lines, fmt.Sprintf("  - %s / %s", strings.TrimRight(strings.TrimSpace(target.ClusterURI), "/"), strings.TrimSpace(target.Database)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func formatConfiguredServices(services []string) string {
+	if len(services) == 0 {
+		return "  - (none)"
+	}
+	lines := make([]string, 0, len(services))
+	for _, service := range services {
+		lines = append(lines, "  - "+strings.TrimRight(strings.TrimSpace(service), "/"))
+	}
+	return strings.Join(lines, "\n")
+}
+
 func (s *server) defaultClusterURI() string {
 	if s.defaultSvc != nil {
 		return s.defaultSvc.ServiceURI
@@ -1699,9 +2106,13 @@ func (s *server) defaultDatabaseFor(clusterURI, provided string) string {
 	}
 	key := normalizeServiceURI(clusterURI)
 	for _, svc := range s.knownServices {
-		if normalizeServiceURI(svc.ServiceURI) == key && svc.DefaultDatabase != "" {
+		if normalizeServiceURI(svc.ServiceURI) != key {
+			continue
+		}
+		if svc.DefaultDatabase != "" {
 			return svc.DefaultDatabase
 		}
+		break
 	}
 	if s.cfg.database != "" {
 		return s.cfg.database

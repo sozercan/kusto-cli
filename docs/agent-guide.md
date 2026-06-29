@@ -5,6 +5,7 @@
 Use human-friendly commands first:
 
 ```bash
+kusto-cli ask 'show recent storm events'
 kusto-cli query 'StormEvents | count'
 kusto-cli databases list
 kusto-cli tables describe StormEvents
@@ -40,3 +41,15 @@ kusto-cli --auth env --service-uri https://help.kusto.windows.net --database Sam
 ```
 
 Use `--auth azcli` only when `az login` has already completed outside the agent run.
+
+## Target selection for ask
+
+`ask` must resolve one Target before it generates a Query Draft. Provide both `--service-uri` and `--database`, or configure a Target Catalog alias and select it with `--target`:
+
+```bash
+kusto-cli --known-services '[{"alias":"samples","service_uri":"https://help.kusto.windows.net","default_database":"Samples"}]' \
+  --target samples \
+  ask 'show recent storm events'
+```
+
+If multiple targets are configured and none is selected, `ask` fails instead of choosing from prompt text.

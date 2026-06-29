@@ -20,7 +20,7 @@ The current implementation is intentionally small and standard-library only:
 ## Design choices
 
 - Self-contained Go implementation.
-- No persistent local config.
+- Small JSON config for defaults and Target Catalog aliases.
 - No interactive prompts.
 - Bearer tokens are never printed.
 - Direct `query`, `command`, `tools`, and `call` modes make validation and agent scripting straightforward.
