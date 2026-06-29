@@ -1,10 +1,30 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
 )
+
+type recordingQueryDraftAgent struct {
+	called bool
+	req    queryDraftRequest
+}
+
+func (a *recordingQueryDraftAgent) GenerateQueryDraft(_ context.Context, req queryDraftRequest) (queryDraft, error) {
+	a.called = true
+	a.req = req
+	return queryDraft{
+		Query:       "StormEvents | take 5",
+		Assumptions: []string{"Using the public sample StormEvents table."},
+		Warnings:    []string{"Fake agent response for deterministic tests."},
+		SchemaContext: []queryDraftSchemaContext{
+			{Source: "fake-test", Entities: []string{"StormEvents"}},
+		},
+	}, nil
+}
 
 func TestValidateQueryAndCommand(t *testing.T) {
 	if err := validateQuery("// comment\nStormEvents | count"); err != nil {
@@ -82,5 +102,116 @@ func TestDeeplinkLooksRight(t *testing.T) {
 	link := buildDeeplink("https://help.kusto.windows.net", "Samples", "StormEvents | count")
 	if !strings.HasPrefix(link, "https://dataexplorer.azure.com/clusters/help.kusto.windows.net/databases/Samples?query=") {
 		t.Fatalf("unexpected deeplink: %s", link)
+	}
+}
+
+func TestAskMissingPromptReturnsUsageError(t *testing.T) {
+	var out bytes.Buffer
+	s := &server{
+		cfg:    config{serviceURI: "https://help.kusto.windows.net", database: "Samples", output: "json"},
+		stdout: &out,
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	err := s.runCommand(context.Background(), []string{"ask"})
+	if err == nil || !strings.Contains(err.Error(), "usage: kusto-cli ask '<natural-language prompt>'") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("missing prompt wrote output: %q", out.String())
+	}
+}
+
+func TestAskUsesFakedQueryDraftAgentAndWritesStableJSON(t *testing.T) {
+	var out bytes.Buffer
+	agent := &recordingQueryDraftAgent{}
+	s := &server{
+		cfg:             config{serviceURI: "https://help.kusto.windows.net", database: "Samples", output: "json"},
+		queryDraftAgent: agent,
+		stdout:          &out,
+	}
+	if err := s.loadKnownServices(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.runCommand(context.Background(), []string{"ask", "show", "recent", "storm", "events"}); err != nil {
+		t.Fatal(err)
+	}
+	if !agent.called {
+		t.Fatal("fake Query Draft Agent was not called")
+	}
+	if agent.req.Prompt != "show recent storm events" {
+		t.Fatalf("prompt = %q; want joined natural-language prompt", agent.req.Prompt)
+	}
+	if agent.req.Target.ClusterURI != "https://help.kusto.windows.net" || agent.req.Target.Database != "Samples" {
+		t.Fatalf("target = %#v; want public sample target", agent.req.Target)
+	}
+
+	want := `{
+  "format": "query_draft",
+  "target": {
+    "cluster_uri": "https://help.kusto.windows.net",
+    "database": "Samples"
+  },
+  "prompt": "show recent storm events",
+  "query": "StormEvents | take 5",
+  "assumptions": [
+    "Using the public sample StormEvents table."
+  ],
+  "warnings": [
+    "Fake agent response for deterministic tests."
+  ],
+  "schema_context": [
+    {
+      "source": "fake-test",
+      "entities": [
+        "StormEvents"
+      ]
+    }
+  ],
+  "validation": {
+    "status": "passed",
+    "read_only": true,
+    "checks": [
+      {
+        "name": "query_not_empty",
+        "passed": true
+      },
+      {
+        "name": "not_management_command",
+        "passed": true
+      }
+    ],
+    "errors": []
+  },
+  "execution": {
+    "executed": false,
+    "reason": "generate-only; execution requires an explicit execution gate"
+  }
+}
+`
+	if out.String() != want {
+		t.Fatalf("ask JSON output mismatch\ngot:\n%s\nwant:\n%s", out.String(), want)
+	}
+
+	var generic map[string]any
+	if err := json.Unmarshal(out.Bytes(), &generic); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := generic["execution_result"]; ok {
+		t.Fatal("ask output must not include an execution result")
+	}
+}
+
+func TestFakeQueryDraftAgentEscapesPrompt(t *testing.T) {
+	draft, err := fakeQueryDraftAgent{}.GenerateQueryDraft(context.Background(), queryDraftRequest{
+		Target: queryDraftTarget{ClusterURI: "https://help.kusto.windows.net", Database: "Samples"},
+		Prompt: "can't find storms",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if draft.Query != "search 'can''t find storms'\n| take 10" {
+		t.Fatalf("query = %q", draft.Query)
 	}
 }

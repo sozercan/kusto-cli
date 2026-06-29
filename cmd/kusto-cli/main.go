@@ -52,11 +52,13 @@ type config struct {
 }
 
 type server struct {
-	cfg           config
-	hc            *http.Client
-	auth          *tokenProvider
-	knownServices []KustoServiceConfig
-	defaultSvc    *KustoServiceConfig
+	cfg             config
+	hc              *http.Client
+	auth            *tokenProvider
+	queryDraftAgent queryDraftAgent
+	stdout          io.Writer
+	knownServices   []KustoServiceConfig
+	defaultSvc      *KustoServiceConfig
 }
 
 type tokenProvider struct {
@@ -113,6 +115,57 @@ type kustoResponse struct {
 	Format string `json:"format"`
 }
 
+type queryDraftTarget struct {
+	ClusterURI string `json:"cluster_uri"`
+	Database   string `json:"database"`
+}
+
+type queryDraftRequest struct {
+	Target queryDraftTarget `json:"target"`
+	Prompt string           `json:"prompt"`
+}
+
+type queryDraft struct {
+	Format        string                    `json:"format"`
+	Target        queryDraftTarget          `json:"target"`
+	Prompt        string                    `json:"prompt"`
+	Query         string                    `json:"query"`
+	Assumptions   []string                  `json:"assumptions"`
+	Warnings      []string                  `json:"warnings"`
+	SchemaContext []queryDraftSchemaContext `json:"schema_context"`
+	Validation    queryDraftValidation      `json:"validation"`
+	Execution     queryDraftExecution       `json:"execution"`
+}
+
+type queryDraftSchemaContext struct {
+	Source   string   `json:"source"`
+	Entities []string `json:"entities"`
+}
+
+type queryDraftValidation struct {
+	Status   string                      `json:"status"`
+	ReadOnly bool                        `json:"read_only"`
+	Checks   []queryDraftValidationCheck `json:"checks"`
+	Errors   []string                    `json:"errors"`
+}
+
+type queryDraftValidationCheck struct {
+	Name    string `json:"name"`
+	Passed  bool   `json:"passed"`
+	Message string `json:"message,omitempty"`
+}
+
+type queryDraftExecution struct {
+	Executed bool   `json:"executed"`
+	Reason   string `json:"reason"`
+}
+
+type queryDraftAgent interface {
+	GenerateQueryDraft(context.Context, queryDraftRequest) (queryDraft, error)
+}
+
+type fakeQueryDraftAgent struct{}
+
 func main() {
 	cfg := parseFlags()
 	if cfg.printVersion {
@@ -155,9 +208,11 @@ func run(ctx context.Context, cfg config) error {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSHandshakeTimeout = cfg.timeout
 	s := &server{
-		cfg:  cfg,
-		hc:   &http.Client{Timeout: cfg.timeout, Transport: transport},
-		auth: &tokenProvider{mode: cfg.authMode, tokenEnv: cfg.tokenEnv, tenant: cfg.tenant, debug: cfg.debug},
+		cfg:             cfg,
+		hc:              &http.Client{Timeout: cfg.timeout, Transport: transport},
+		auth:            &tokenProvider{mode: cfg.authMode, tokenEnv: cfg.tokenEnv, tenant: cfg.tenant, debug: cfg.debug},
+		queryDraftAgent: fakeQueryDraftAgent{},
+		stdout:          os.Stdout,
 	}
 	if err := s.loadKnownServices(); err != nil {
 		return err
@@ -209,6 +264,8 @@ func (s *server) loadKnownServices() error {
 
 func (s *server) runCommand(ctx context.Context, args []string) error {
 	switch args[0] {
+	case "ask":
+		return s.runAskCommand(ctx, args[1:])
 	case "query":
 		return s.runQueryCommand(ctx, args[1:])
 	case "command":
@@ -247,6 +304,134 @@ func (s *server) runCommand(ctx context.Context, args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q (run 'kusto-cli help')", args[0])
 	}
+}
+
+func (s *server) runAskCommand(ctx context.Context, args []string) error {
+	prompt := strings.TrimSpace(strings.Join(args, " "))
+	if prompt == "" {
+		return errors.New("usage: kusto-cli ask '<natural-language prompt>'")
+	}
+	target, err := s.queryDraftTarget()
+	if err != nil {
+		return err
+	}
+	agent := s.queryDraftAgent
+	if agent == nil {
+		agent = fakeQueryDraftAgent{}
+	}
+	draft, err := agent.GenerateQueryDraft(ctx, queryDraftRequest{Target: target, Prompt: prompt})
+	if err != nil {
+		return err
+	}
+	normalizeQueryDraft(&draft, target, prompt)
+	return writeQueryDraft(s.output(), s.cfg.output, draft)
+}
+
+func (s *server) queryDraftTarget() (queryDraftTarget, error) {
+	clusterURI := strings.TrimSpace(s.defaultClusterURI())
+	if clusterURI == "" {
+		clusterURI = strings.TrimSpace(s.cfg.serviceURI)
+	}
+	if clusterURI == "" {
+		return queryDraftTarget{}, errors.New("ask requires a target; provide --service-uri and --database")
+	}
+	clusterURI = strings.TrimRight(clusterURI, "/")
+	if _, err := url.ParseRequestURI(clusterURI); err != nil {
+		return queryDraftTarget{}, fmt.Errorf("service-uri is not a valid URL: %w", err)
+	}
+	database := s.defaultDatabaseFor(clusterURI, s.cfg.database)
+	if strings.TrimSpace(database) == "" {
+		return queryDraftTarget{}, errors.New("ask requires a target database; provide --database")
+	}
+	return queryDraftTarget{ClusterURI: clusterURI, Database: strings.TrimSpace(database)}, nil
+}
+
+func (fakeQueryDraftAgent) GenerateQueryDraft(_ context.Context, req queryDraftRequest) (queryDraft, error) {
+	prompt := strings.TrimSpace(req.Prompt)
+	if prompt == "" {
+		return queryDraft{}, errors.New("prompt is required")
+	}
+	return queryDraft{
+		Format: "query_draft",
+		Target: req.Target,
+		Prompt: prompt,
+		Query:  "search " + kqlStringLiteral(prompt) + "\n| take 10",
+		Assumptions: []string{
+			"Generated by the fake Query Draft Agent tracer bullet.",
+			"No live schema discovery or model provider was used.",
+		},
+		Warnings: []string{
+			"Generated KQL was not executed.",
+			"Review the Query Draft before using an execution gate.",
+		},
+		SchemaContext: []queryDraftSchemaContext{},
+	}, nil
+}
+
+func normalizeQueryDraft(draft *queryDraft, target queryDraftTarget, prompt string) {
+	if draft.Format == "" {
+		draft.Format = "query_draft"
+	}
+	if draft.Target.ClusterURI == "" {
+		draft.Target.ClusterURI = target.ClusterURI
+	}
+	if draft.Target.Database == "" {
+		draft.Target.Database = target.Database
+	}
+	if draft.Prompt == "" {
+		draft.Prompt = prompt
+	}
+	if draft.Assumptions == nil {
+		draft.Assumptions = []string{}
+	}
+	if draft.Warnings == nil {
+		draft.Warnings = []string{}
+	}
+	if draft.SchemaContext == nil {
+		draft.SchemaContext = []queryDraftSchemaContext{}
+	}
+	for i := range draft.SchemaContext {
+		if draft.SchemaContext[i].Entities == nil {
+			draft.SchemaContext[i].Entities = []string{}
+		}
+	}
+	draft.Validation = validateQueryDraftShape(draft.Query)
+	if draft.Validation.Status != "passed" {
+		draft.Warnings = append(draft.Warnings, "Generated query failed basic validation; do not execute it until corrected.")
+	}
+	draft.Execution.Executed = false
+	if draft.Execution.Reason == "" {
+		draft.Execution.Reason = "generate-only; execution requires an explicit execution gate"
+	}
+}
+
+func validateQueryDraftShape(query string) queryDraftValidation {
+	trimmed := strings.TrimSpace(query)
+	checks := []queryDraftValidationCheck{
+		{Name: "query_not_empty", Passed: trimmed != ""},
+		{Name: "not_management_command", Passed: !strings.HasPrefix(firstStatement(query), ".")},
+	}
+	errs := []string{}
+	if !checks[0].Passed {
+		checks[0].Message = "query is required"
+		errs = append(errs, checks[0].Message)
+	}
+	if !checks[1].Passed {
+		checks[1].Message = "generated query must not be a management command"
+		errs = append(errs, checks[1].Message)
+	}
+	status := "passed"
+	if len(errs) > 0 {
+		status = "failed"
+	}
+	return queryDraftValidation{Status: status, ReadOnly: checks[0].Passed && checks[1].Passed, Checks: checks, Errors: errs}
+}
+
+func (s *server) output() io.Writer {
+	if s.stdout != nil {
+		return s.stdout
+	}
+	return os.Stdout
 }
 
 func (s *server) runQueryCommand(ctx context.Context, args []string) error {
@@ -402,6 +587,7 @@ func (s *server) runAPICommand(ctx context.Context, args []string) error {
 
 func printKustoUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
+  kusto-cli --service-uri <cluster> --database <db> ask '<natural-language prompt>'
   kusto-cli --service-uri <cluster> --database <db> query '<kql>'
   kusto-cli databases list
   kusto-cli tables list
@@ -462,6 +648,67 @@ func writeOutput(w io.Writer, format string, v any) error {
 	default:
 		return fmt.Errorf("unknown output format %q", format)
 	}
+}
+
+func writeQueryDraft(w io.Writer, format string, draft queryDraft) error {
+	switch strings.ToLower(format) {
+	case "", "json":
+		return writeOutput(w, "json", draft)
+	case "table":
+		fmt.Fprintf(w, "Target: %s / %s\n", draft.Target.ClusterURI, draft.Target.Database)
+		fmt.Fprintf(w, "Prompt: %s\n\n", draft.Prompt)
+		fmt.Fprintf(w, "Query:\n%s\n\n", draft.Query)
+		writeBullets(w, "Assumptions", draft.Assumptions)
+		writeBullets(w, "Warnings", draft.Warnings)
+		fmt.Fprintf(w, "Validation: %s (read_only=%t)\n", draft.Validation.Status, draft.Validation.ReadOnly)
+		for _, check := range draft.Validation.Checks {
+			status := "failed"
+			if check.Passed {
+				status = "passed"
+			}
+			if check.Message == "" {
+				fmt.Fprintf(w, "- %s: %s\n", check.Name, status)
+				continue
+			}
+			fmt.Fprintf(w, "- %s: %s (%s)\n", check.Name, status, check.Message)
+		}
+		fmt.Fprintf(w, "Execution: not executed (%s)\n", draft.Execution.Reason)
+		return nil
+	case "tsv", "plain":
+		fmt.Fprintf(w, "format\t%s\n", oneLine(draft.Format))
+		fmt.Fprintf(w, "target.cluster_uri\t%s\n", oneLine(draft.Target.ClusterURI))
+		fmt.Fprintf(w, "target.database\t%s\n", oneLine(draft.Target.Database))
+		fmt.Fprintf(w, "prompt\t%s\n", oneLine(draft.Prompt))
+		fmt.Fprintf(w, "query\t%s\n", oneLine(draft.Query))
+		fmt.Fprintf(w, "assumptions\t%s\n", oneLine(strings.Join(draft.Assumptions, "; ")))
+		fmt.Fprintf(w, "warnings\t%s\n", oneLine(strings.Join(draft.Warnings, "; ")))
+		fmt.Fprintf(w, "validation.status\t%s\n", oneLine(draft.Validation.Status))
+		fmt.Fprintf(w, "validation.read_only\t%t\n", draft.Validation.ReadOnly)
+		fmt.Fprintf(w, "execution.executed\t%t\n", draft.Execution.Executed)
+		fmt.Fprintf(w, "execution.reason\t%s\n", oneLine(draft.Execution.Reason))
+		return nil
+	default:
+		return fmt.Errorf("unknown output format %q", format)
+	}
+}
+
+func writeBullets(w io.Writer, title string, items []string) {
+	fmt.Fprintf(w, "%s:\n", title)
+	if len(items) == 0 {
+		fmt.Fprintln(w, "- (none)")
+		return
+	}
+	for _, item := range items {
+		fmt.Fprintf(w, "- %s\n", item)
+	}
+}
+
+func oneLine(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	s = strings.ReplaceAll(s, "\t", `\t`)
+	return s
 }
 
 func writeDirectText(w io.Writer, format string, text string) error {
@@ -669,7 +916,7 @@ func runCompletionCommand(name string, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: completion <bash|zsh|fish>")
 	}
-	commands := "query command databases tables entities services deeplink queryplan diagnostics api auth config completion"
+	commands := "ask query command databases tables entities services deeplink queryplan diagnostics api auth config completion"
 	switch args[0] {
 	case "bash":
 		fmt.Fprintf(os.Stdout, "complete -W %q %s\n", commands, name)
@@ -1418,7 +1665,8 @@ func b64Encode(b []byte) string {
 	}
 	return out.String()
 }
-func kqlEscapeString(v string) string { return strings.ReplaceAll(v, "'", "''") }
+func kqlEscapeString(v string) string  { return strings.ReplaceAll(v, "'", "''") }
+func kqlStringLiteral(v string) string { return "'" + kqlEscapeString(v) + "'" }
 func kqlEscapeEntityName(name string) string {
 	n := strings.TrimSpace(name)
 	if (strings.HasPrefix(n, "['") && strings.HasSuffix(n, "']")) || (strings.HasPrefix(n, "[\"") && strings.HasSuffix(n, "\"]")) {
