@@ -29,3 +29,7 @@ Kusto query and command tools return text content containing JSON:
 - `kusto_command` requires management commands starting with `.`.
 - Read-only operations set `request_readonly` and `request_readonly_hardline`.
 - Attempts to override readonly flags through `client_request_properties` fail.
+
+## Query Draft command output
+
+`ask` is currently a direct CLI command rather than a stdio tool. Agents that shell out to `kusto-cli ask` should parse the JSON response with `format: "query_draft"` and follow the [Agent guide](agent-guide.md#how-agents-should-consume-query-drafts). Generation and execution are separated: without `--execute`, `execution.executed` is `false`; with `--execute`, execution still requires Query Draft validation to pass.

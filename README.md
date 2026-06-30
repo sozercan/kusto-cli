@@ -38,6 +38,26 @@ Run a query:
 kusto-cli --service-uri https://help.kusto.windows.net --database Samples query 'StormEvents | count'
 ```
 
+Generate a Query Draft from natural language without executing it:
+
+```bash
+kusto-cli --service-uri https://help.kusto.windows.net --database Samples ask 'show recent storm events'
+```
+
+Execute a Query Draft only after it passes static validation by using the explicit Execution Gate. Execution uses read-only Kusto request properties and caps returned records (default 100, configurable with `--max-rows`):
+
+```bash
+kusto-cli --service-uri https://help.kusto.windows.net --database Samples ask --execute --max-rows 25 'show recent storm events'
+```
+
+Or select the same Target from a Target Catalog alias:
+
+```bash
+kusto-cli --known-services '[{"alias":"samples","service_uri":"https://help.kusto.windows.net","default_database":"Samples"}]' \
+  --target samples \
+  ask 'show recent storm events'
+```
+
 List databases:
 
 ```bash
@@ -79,6 +99,8 @@ kusto-cli auth status
 
 | Command | Description |
 |---------|-------------|
+| `kusto-cli ask '<natural-language prompt>'` | Generate a Query Draft without executing it |
+| `kusto-cli ask --execute [--max-rows N] '<natural-language prompt>'` | Execute only after the Query Draft passes static safety validation |
 | `kusto-cli query '<kql>'` | Run a KQL query |
 | `kusto-cli command '.show tables'` | Run a management command |
 | `kusto-cli databases list` | List databases |
@@ -121,13 +143,16 @@ kusto-cli --service-uri https://help.kusto.windows.net --database Samples -o tab
 
 ## Documentation
 
+- [Ask Query Drafts](docs/ask.md)
 - [Agent guide](docs/agent-guide.md)
 - [Authentication](docs/auth.md)
 - [Configuration](docs/config.md)
+- [Model providers](docs/providers.md)
 - [Safety](docs/safety.md)
 - [Release](docs/release.md)
 - [Protocol behavior](docs/protocol.md)
 - [Architecture](docs/architecture.md)
+- [Public ask examples](examples/ask/README.md)
 
 ## Development
 
@@ -136,6 +161,8 @@ make test-short
 make vet
 make build-static
 ```
+
+Offline Query Draft eval fixtures live in [evals/ask](evals/ask/README.md) and run as part of `go test ./...`.
 
 ## License
 

@@ -1,6 +1,6 @@
 # Safety
 
-`kusto-cli` separates read operations from write-capable operations.
+`kusto-cli` separates read operations from write-capable operations. Natural-language `ask` is stricter than direct exact-KQL commands because it generates a Query Draft that must be inspectable before it touches a cluster.
 
 ## Read-only defaults
 
@@ -9,7 +9,7 @@ Read-oriented tools set Kusto readonly request properties:
 - `request_readonly`
 - `request_readonly_hardline`
 
-User-supplied client request properties cannot override those flags.
+User-supplied client request properties cannot override those flags. When `ask --execute` passes the Execution Gate, it uses the same read-only execution path and also sets a returned-record cap with `query_take_max_records`.
 
 ## Write-capable operations
 
@@ -20,9 +20,63 @@ The following operations require `--allow-write`:
 
 Use `--dry-run` to preview write-capable direct calls without executing them.
 
+## Management-command refusal for `ask`
+
+`ask` refuses management commands entirely, including read-only `.show` commands. This keeps the Query Draft Agent scoped to read-only KQL query expressions. Use explicit CLI commands for management or schema tasks instead:
+
+```bash
+kusto-cli --service-uri https://help.kusto.windows.net --database Samples databases list
+kusto-cli --service-uri https://help.kusto.windows.net --database Samples tables describe StormEvents
+kusto-cli --service-uri https://help.kusto.windows.net --database Samples command '.show tables'
+```
+
+`command` still applies its own management-command safety rules; write-capable commands require `--allow-write`.
+
+## Query Draft safety validation v1
+
+`ask` is generate-first and does not execute generated KQL unless the user supplies the explicit Execution Gate with `ask --execute`. The model provider's `model_safety` field is advisory only; the CLI-owned Query Draft validator is authoritative and records its result in `validation`.
+
+The v1 static validator is conservative and intentionally not a full KQL parser. A Query Draft is considered execution-eligible only when validation status is `passed` and `safe_for_execution` is `true`:
+
+- Generated output must be raw KQL, not Markdown code fences or prose.
+- Management commands are blocked for `ask`, including read-only `.show` commands.
+- Obvious write-capable or destructive shapes are blocked, including ingestion, `into table`, create/alter/drop/delete/purge/rename/move/truncate forms, and set-or-append/set-or-replace forms.
+- Multi-statement output may contain only `let` declarations or `declare query_parameters` statements before one final query expression. Multiple executable query statements and generated `set` request-option statements are blocked.
+- Exploratory row-returning drafts must include an explicit result bound (`take`, `limit`, `top`, or `sample`) or a reducing aggregation such as `count`, `summarize`, or `make-series`. Unbounded drafts produce validation warnings and are not execution-eligible until corrected.
+- If schema/prompt ambiguity blocks a safe table or function choice, a Query Draft may set `clarification_required` with a concise `clarification_question` instead of hallucinating a table choice. Non-blocking ambiguity should appear as explicit `assumptions`.
+
+## Result bounding and Execution Gate
+
+When `ask --execute` is used, execution is attempted only after static validation passes. The execution request uses Kusto read-only request properties plus a returned-record cap. The default cap is 100 rows and can be changed with `ask --execute --max-rows <N>` or `--execute-max-rows <N>`.
+
+Execution results or execution errors are reported under `execution` in the Query Draft response. Query results are not sent back to the model provider by default, and `data_disclosure_policy.sent_to_model_provider.query_results` remains `false`.
+
+## Disclosure defaults
+
+The default Data Disclosure Policy is `schema-only`:
+
+- compact Schema Context may be sent to the model provider;
+- docstrings may be sent when present;
+- bundled public KQL examples may be sent as examples/shots guidance;
+- configured shots may be sent only after read-only retrieval and safety filtering;
+- raw sample rows are not sent unless the user explicitly opts in with `--include-samples` or `--include-sample-rows`;
+- query results are not sent to the model provider by default, even after `--execute`.
+
+`ask` reports disclosure under `data_disclosure_policy.sent_to_model_provider` so agents and reviewers can see what left the process boundary for the provider call.
+
+## Query Draft examples and configured shots
+
+`ask` may send bundled public KQL examples and, when `--shots-table` or `KUSTO_SHOTS_TABLE` is configured, matching configured shots to the model provider. Bundled examples contain only generic public read-only KQL shapes. Configured shots are retrieved read-only from the selected Target, filtered to safe bounded Query Draft examples before disclosure, and reported in the Query Draft `examples` field. `data_disclosure_policy.sent_to_model_provider.shots` records whether any examples or shots were sent. Missing shots configuration does not block `ask`; retrieval failures become warnings and the command continues with bundled examples.
+
+## Query-plan validation and Repair Passes
+
+`ask --validate-plan` requests Kusto-side query-plan validation with `.show queryplan <| <draft query>` after static safety validation passes and before any `--execute` query execution. The same behavior can be enabled for scripted use with `KUSTO_ASK_VALIDATE_PLAN=true`. If query-plan validation fails, the Query Draft is returned with `validation.query_plan.status="failed"`, the validation error is recorded, and execution is blocked.
+
+`ask --repair` enables bounded Repair Passes, and `KUSTO_ASK_REPAIR=true` can enable the same behavior for scripted use. A Repair Pass sends only the original prompt, Target, Schema Context, Data Disclosure Policy, examples, previous query, and validation error to the Query Draft Agent/provider seam. It does not send execution results back to the model provider and it does not run exploratory queries or sample-data probes; the only Kusto-side validation route used by this feature is the explicit query-plan validation path. `--repair` implies query-plan validation. The default maximum is one Repair Pass; use `--max-repair-attempts <N>` (maximum 5) or `KUSTO_ASK_MAX_REPAIR_ATTEMPTS` to set a strict bound. If repair fails or the maximum is exhausted, `ask` returns the last Query Draft, the last validation error, and `repair_history` without executing.
+
 ## Agent guidance
 
-- Prefer `kusto_query` for KQL queries.
+- Prefer `ask` for natural-language Query Drafts and `kusto_query` for exact KQL queries.
 - Use `kusto_command` only for management commands.
 - Run `schema <tool>` before calling unfamiliar tools.
 - Keep credentials in environment variables or an external credential provider.
